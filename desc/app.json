@@ -1,10 +1,12 @@
 {
   "uuid": "<APP_UUID>",
-  "name": "APP DEV Template",
-  "description": "Microfirmware Application Template for Atari ST",
+  "name": "MD/ZX",
+  "description": "ZX Spectrum 48K emulator for the Atari ST",
   "image": "https://placehold.co/256x256/png",
   "tags": [
-    "Sample",
+    "Emulator",
+    "ZX Spectrum",
+    "Games"
   ],
   "devices": [
     "ST",

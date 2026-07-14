@@ -2,7 +2,7 @@
 
 // We don't have any variables because this is the placeholder app
 static SettingsConfigEntry defaultEntries[] = {
-    {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/test"},
+    {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/zx"},
     {ACONFIG_PARAM_MODE, SETTINGS_TYPE_INT, "255"},  // 255: Menu mode
 };
 

@@ -14,7 +14,7 @@
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 
-#define COMM_RING_BITS 15u
+#define COMM_RING_BITS 12u  /* md-zx: ROM3 carries only IKBD bytes (<1/ms), drained sub-ms; 32K->4K to fit the emulator */
 #define COMM_RING_SIZE_BYTES (1ul << COMM_RING_BITS)
 #define COMM_RING_WORDS (COMM_RING_SIZE_BYTES / sizeof(uint16_t))
 #define COMM_RING_MASK (COMM_RING_WORDS - 1u)

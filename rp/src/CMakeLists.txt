@@ -112,11 +112,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         ikbd.c
         hw_config.c
         palette.c
-        demo_menu.c
-        demo_parallax.c
-        demo_3d.c
-        demo_sprites.c
-        demo_cojorotozoom.c
+        zxemu.c
         reset.c
         romemul.c
         sdcard.c
@@ -154,6 +150,7 @@ target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
+    ${CMAKE_CURRENT_LIST_DIR}/zx
     ${CMAKE_CURRENT_LIST_DIR}/..)
 
 
@@ -237,6 +234,19 @@ add_definitions(-D_DEBUG=${_DEBUG})
 
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)
+
+# ZX Spectrum port: compile-time phase gates (see rp/src/zx/zx_config.h).
+# Toggle any phase from the build to test functionality in isolation on
+# hardware, e.g.  cmake --preset pico_w-release -DZX_GAMES_FROM_SD=0
+set(ZX_INPUT_KEYBOARD 1 CACHE STRING "ST keyboard input -> Kempston/keys (Phase 2)")
+set(ZX_AUDIO_YM       1 CACHE STRING "Spectrum beeper -> YM2149 audio (Phase 3)")
+set(ZX_GAMES_FROM_SD  1 CACHE STRING "Load games + keymaps.txt from SD (Phase 4)")
+set(ZX_INPUT_JOYSTICK 0 CACHE STRING "ST joystick -> Kempston (Phase 5; needs m68k rebuild)")
+add_definitions(
+    -DZX_INPUT_KEYBOARD=${ZX_INPUT_KEYBOARD}
+    -DZX_AUDIO_YM=${ZX_AUDIO_YM}
+    -DZX_GAMES_FROM_SD=${ZX_GAMES_FROM_SD}
+    -DZX_INPUT_JOYSTICK=${ZX_INPUT_JOYSTICK})
 
 # We don't modify the flash in Core 1
 add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)

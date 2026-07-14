@@ -64,6 +64,12 @@ void ikbd_consume_rom3_sample(uint16_t addr_lsb);
  * Call once per main-loop iteration. */
 void ikbd_pump(void);
 
+/* Latest Atari ST joystick state decoded by ikbd_pump: bit0 up,
+ * bit1 down, bit2 left, bit3 right, bit7 fire. Returns 0 unless the
+ * build enables joystick support (ZX_INPUT_JOYSTICK) and the m68k side
+ * is emitting joystick event packets. */
+uint8_t ikbd_get_joystick(void);
+
 /* Approximate number of raw bytes currently in the ring. */
 size_t ikbd_ring_count(void);
 

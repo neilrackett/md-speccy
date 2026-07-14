@@ -99,6 +99,7 @@ UFW_SCREEN_PAGE       equ $00077FEC          ; longword: current draw page addre
 ; bytes are simply not copied (they remain stale on the screen page).
 FBDRV_ITER_BYTES      equ 48                            ; 12 longwords: D0-D7 + A1-A4 (A6=src, A5=dst, A0=dedicated audio pointer, A7=SP preserved -- IRQs may fire during the macro).
 FBDRV_IKBD_POLL_EVERY equ 40                            ; insert inline IKBD poll every Nth MOVEM iter. 40 iters * ~31us = ~1.24ms (~20 HBLs).
+ZX_JOYSTICK           equ 0                            ; md-zx Phase 5: 1 = enable ST joystick event reporting ($14). Off by default (keyboard is the reliable path).
 FBDRV_TOTAL_BYTES     equ (FB_COPY_LINES * FB_ROW_BYTES) ; honours FB_COPY_LINES
 FBDRV_MAIN_ITERS      equ (FBDRV_TOTAL_BYTES / FBDRV_ITER_BYTES)
 FBDRV_MAIN_BYTES      equ (FBDRV_MAIN_ITERS * FBDRV_ITER_BYTES)
@@ -473,6 +474,18 @@ userfw:
 
     ; Interrupts back on (caller's level, typically $2300).
     move.w  (sp)+, sr
+
+    ; --- md-zx Phase 5 (optional): enable IKBD joystick event reporting.
+    ; Sends $14 so the IKBD emits $FE/$FF joystick packets, which the RP
+    ; demux (ikbd.c, ZX_INPUT_JOYSTICK) maps to Kempston. Off by default
+    ; (ZX_JOYSTICK=0) so the reliable keyboard-only path is unchanged.
+    ; Keyboard scancodes continue alongside joystick events.
+    ifne    ZX_JOYSTICK
+.zxj_tx_wait:
+    btst    #1, ACIA_KBD_STATUS.w        ; MC6850 TDRE = TX data register empty
+    beq.s   .zxj_tx_wait
+    move.b  #$14, ACIA_KBD_DATA.w        ; IKBD: set joystick event reporting
+    endc
 
     ; Initialise the hidden-page pointer. UFW_SCREEN_PAGE holds the
     ; page currently being drawn into; .after_copy toggles it between
