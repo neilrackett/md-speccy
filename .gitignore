@@ -53,6 +53,7 @@ dkms.conf
 
 ffconf.h.bak
 secrets.sh
+/uuid.txt
 upload_s3.sh
 .history/
 build/
@@ -64,3 +65,5 @@ dist/
 docs/epics/
 __pycache__/
 *.pyc
+
+.DS_Store
