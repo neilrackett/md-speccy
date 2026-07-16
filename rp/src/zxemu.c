@@ -23,7 +23,7 @@
 #include "palette.h"
 #include "zxemu.h"
 
-#include "device_config.h" // Buttons / audio / display metrics.
+#include "device_config.h" // Audio / display metrics.
 
 // VRAM update tracking function, this is used inside mem.h.
 void vram_set_dirty_bitmap(uint16_t addr);
@@ -44,7 +44,6 @@ void vram_force_dirty(void);
 #include "aconfig.h"
 #include "settings/settings.h"
 #include "builtin_game.h"     // embedded demo seeded into an empty /zx
-#include "builtin_keymaps.h"  // firmware-default keymaps.txt
 
 // The Spectrum bitmap (256x192) is shown 1:1, centred in the 320x200
 // framebuffer; the surrounding margin is the Spectrum border.
@@ -52,14 +51,6 @@ void vram_force_dirty(void);
 #define ZX_FB_Y0 ((FB_CHUNKED_H - 192) / 2)   // 4
 
 #define ZX_DEFAULT_SCANLINE_PERIOD 150
-
-// Composite gameplay button bitmask read by get_device_button() (see
-// device_config.h). Recomposed each frame in zxemu_render_frame() from
-// the keyboard mask and, when ZX_INPUT_JOYSTICK is built, the ST
-// joystick.
-uint32_t zx_input_mask = 0;
-// Keyboard-driven button bits, updated by zxemu_handle_key().
-static uint32_t zx_kbd_mask = 0;
 
 // Blink phase for the Spectrum FLASH attribute, toggled by the frame
 // counter in zxemu_render_frame().
@@ -90,7 +81,6 @@ void load_game(int game_id);
 /* =============================== Games list =============================== */
 
 #define ZX_MAX_GAMES     128    // Max .z80 snapshots listed from SD.
-#define ZX_KEYMAP_BUF_SZ 4096   // RAM buffer for the SD keymaps.txt.
 #define ZX_YM_VOLUME     12     // YM 4-bit volume for beeper "high".
 #define ZX_DEMO_FILENAME "3dshow_demo.z80"  // seeded into an empty /zx folder
 
@@ -105,41 +95,69 @@ struct game_entry {
 struct game_entry GamesTable[ZX_MAX_GAMES];
 uint32_t GamesTableSize;
 
-/* ============================== Keymap defines ============================ */
+/* ==================== Atari ST keyboard -> ZX Spectrum ==================== */
 
-// Kempston joystick key codes: note that this were redefined compared to
-// the original zx.h file.
-#define KEMPSTONE_FIRE 0xff
-#define KEMPSTONE_LEFT 0xfe
-#define KEMPSTONE_RIGHT 0xfd
-#define KEMPSTONE_DOWN 0xfc
-#define KEMPSTONE_UP 0xfb
+// ST IKBD scancodes we treat specially (cursor cluster + a few others).
+#define ST_SC_ESC     0x01
+#define ST_SC_BACKSP  0x0E
+#define ST_SC_ENTER   0x1C
+#define ST_SC_LSHIFT  0x2A
+#define ST_SC_RSHIFT  0x36
+#define ST_SC_ALT     0x38
+#define ST_SC_SPACE   0x39
+#define ST_SC_CAPSLK  0x3A
+#define ST_SC_CLRHOME 0x47
+#define ST_SC_UP      0x48
+#define ST_SC_LEFT    0x4B
+#define ST_SC_RIGHT   0x4D
+#define ST_SC_DOWN    0x50
+#define ST_SC_INSERT  0x52
+#define ST_SC_DELETE  0x53
 
-// "Virtual" pins.
+// ZX key codes as registered in the emulator kbd matrix. Sym Shift has a
+// standalone code upstream; Caps Shift does not, so we register one at
+// init (see zxemu_init) at an otherwise-unused code.
+#define ZX_KEY_CAPS   0x88   // standalone Caps Shift (registered on EMU.zx.kbd)
+#define ZX_KEY_CAPSLK 0x89   // Caps Lock = Caps Shift + 2 (registered at init)
+#define ZX_KEY_SYM    0x0F   // standalone Sym Shift (already in the matrix)
+#define ZX_KEY_DELETE 0x0C   // Caps Shift + 0
+#define ZX_KEY_ENTER  0x0D
+#define ZX_KEY_CLEFT  0x08   // Spectrum cursor keys (Caps Shift + 5/6/7/8)
+#define ZX_KEY_CRIGHT 0x09
+#define ZX_KEY_CDOWN  0x0A
+#define ZX_KEY_CUP    0x0B
+
+// Positional ST-scancode -> ZX key-code table (0 = unmapped). Alphanumerics
+// map 1:1; Space/Enter/Backspace/Shift/Alt as noted. The cursor cluster and
+// Esc are handled explicitly in zxemu_handle_key.
 //
-// PRESS_AT_TICK is specified when we want a key to be pressed
-// after the game starts, when a specific tick (frame) is reached.
-// This is often useful in order to select the joystick or for
-// similar tasks.
-//
-// Just specify PRESS_AT_TICK as pin, then the frame number, and
-// finally the key.
-#define PRESS_AT_TICK   0xfe // Press at the specified frame.
-#define RELEASE_AT_TICK 0xfd // Release at the specified frame.
-#define KEY_END         0xff // This just marks the end of the key map.
+// Punctuation keys map to the same symbol printed on the ST keycap. On the
+// Spectrum those are Symbol Shift combos, but the kbd matrix registers the
+// punctuation codes with the Sym Shift modifier, so it applies Sym Shift
+// automatically -- one ST key = the combo. (Shifted punctuation still only
+// matches the Spectrum layout, e.g. Alt+T for '>', not ST Shift + '.'.)
+static const uint8_t st2zx[128] = {
+    [0x02]='1',[0x03]='2',[0x04]='3',[0x05]='4',[0x06]='5',
+    [0x07]='6',[0x08]='7',[0x09]='8',[0x0A]='9',[0x0B]='0',
+    [0x10]='q',[0x11]='w',[0x12]='e',[0x13]='r',[0x14]='t',
+    [0x15]='y',[0x16]='u',[0x17]='i',[0x18]='o',[0x19]='p',
+    [0x1E]='a',[0x1F]='s',[0x20]='d',[0x21]='f',[0x22]='g',
+    [0x23]='h',[0x24]='j',[0x25]='k',[0x26]='l',
+    [0x2C]='z',[0x2D]='x',[0x2E]='c',[0x2F]='v',[0x30]='b',
+    [0x31]='n',[0x32]='m',
+    // Punctuation (auto Sym Shift via the matrix): - = ; ' , . /
+    [0x0C]='-',[0x0D]='=',[0x27]=';',[0x28]='\'',
+    [0x33]=',',[0x34]='.',[0x35]='/',
+    [ST_SC_SPACE]=' ',   [ST_SC_ENTER]=ZX_KEY_ENTER,
+    [ST_SC_BACKSP]=ZX_KEY_DELETE, [ST_SC_DELETE]=ZX_KEY_DELETE,
+    [ST_SC_CAPSLK]=ZX_KEY_CAPSLK,
+    [ST_SC_LSHIFT]=ZX_KEY_CAPS, [ST_SC_RSHIFT]=ZX_KEY_CAPS,
+    [ST_SC_ALT]=ZX_KEY_SYM,
+};
 
-// Extended keymaps allow two device buttons (pins) pressed together to map
-// to other Specturm keys. This is useful for games such as Skool Daze
-// that have too many keys doing useful things.
-// 
-// To use this kind of maps, xor KEY_EXT to the first pin, then
-// provide as second entry in the row the second pin, and finally
-// a single Spectrum key code to trigger.
-// 
-// IMPORTANT: the extended key maps of a game must be the initial entries,
-// before the normal entries. This way we avoid also sensing the keys
-// mapped to the single buttons involved.
-#define KEY_EXT         0x80
+// Kempston mask contributed by the cursor keys / Ins / Clr-Home (OR'd with
+// the real ST joystick each frame). Bits are ZX_JOYSTICK_* from zx.h.
+static uint8_t zx_cursor_kempston = 0;
 
 /* ========================== Global state and defines ====================== */
 
@@ -161,13 +179,13 @@ struct emustate {
 
     uint32_t tick; // Frame number since last game load.
 
-    // Keymap in use right now. Modified by load_game().
-    uint8_t keymap[3*100];     // 100 map entries... more than enough.
-    char *keymap_file;         // Pointer of the keymap description file
-                               // inside the flash memory.
+    // Cursor keys act as the Kempston joystick (0, default) or as the
+    // Spectrum cursor keys / Caps Shift+5-8 (1). Toggled from the menu.
+    uint32_t cursor_as_keys;
 
     // Is the game selection / config menu shown?
     int menu_active;
+    int about_active;           // "About" pop-over shown (modal over the menu).
     uint32_t menu_left_at_tick; // EMU.tick when the menu was closed.
     int selected_game;          // Game index of currently selected game in
                                 // the UI. If less than 0 a settings item is
@@ -206,11 +224,13 @@ struct emustate {
 #define UI_EVENT_SYNC 6         // Audio sync wait time modified.
 #define UI_EVENT_BRIGHTNESS 7   // Display brightness modified.
 #define UI_EVENT_PARTIAL 8      // Display partial update toggled.
+#define UI_EVENT_EXIT 9         // "Exit" action item selected.
+#define UI_EVENT_ABOUT 10       // "About" action item selected.
 #define UI_EVENT_NAVIGATION 254 // Just moving around in the menu.
 #define UI_EVENT_DISMISS 255    // Menu dismissed.
 
-const uint32_t SettingsZoomValues[] = {50,75,84,100,112,125,150,200};
-const char *SettingsZoomValuesNames[] = {"50%","75%","84%","100%","112%","125%","150%","200%",NULL};
+const uint32_t CursorValues[] = {0, 1};
+const char *CursorValuesNames[] = {"stick", "keys", NULL};
 struct UISettingsItem {
     uint32_t event;     // Event reported if setting is changed.
     const char *name;   // Name of the setting.
@@ -224,18 +244,20 @@ struct UISettingsItem {
                                // values array. If values is defined, this
                                // must be defined as well.
 } SettingsList[] = {
-    // Only settings that actually do something on this target. The
-    // upstream clock / scaling / brightness / partial-update / audio-sync
-    // controls were dropped: the RP runs at a fixed 225 MHz (no runtime
-    // overclock -- the cart-bus PIO timing is tuned to it), the Spectrum
-    // is always shown 1:1, and there is no display backlight or ST77xx
-    // partial update here.
+    // Left/right adjust the value; items with a NULL ptr are actions
+    // triggered by fire (Exit). Only settings that do something here.
     {UI_EVENT_VOLUME,
         "volume", &EMU.volume, 1, 0, 20, NULL, NULL},
     {UI_EVENT_BORDER,
         "border", &EMU.show_border, 1, 0, 1, NULL, NULL},
     {UI_EVENT_NONE,
-        "scan-p", (uint32_t*)&EMU.zx.scanline_period, 1, 10, 500, NULL, NULL}
+        "cursor", &EMU.cursor_as_keys, 1, 0, 1, CursorValues, CursorValuesNames},
+    {UI_EVENT_NONE,
+        "scan-p", (uint32_t*)&EMU.zx.scanline_period, 1, 10, 500, NULL, NULL},
+    {UI_EVENT_ABOUT,
+        "about", NULL, 0, 0, 0, NULL, NULL},
+    {UI_EVENT_EXIT,
+        "exit", NULL, 0, 0, 0, NULL, NULL},
 };
 
 #define SettingsListLen (sizeof(SettingsList)/sizeof(SettingsList[0]))
@@ -243,7 +265,10 @@ struct UISettingsItem {
 // Convert the setting 'id' name and current value into a string
 // to show as menu item.
 void settings_to_string(char *buf, size_t buflen, int id) {
-    if (SettingsList[id].values == NULL) {
+    if (SettingsList[id].ptr == NULL) {
+        // Action item (e.g. Exit) -- just the name, no value.
+        snprintf(buf, buflen, "%s", SettingsList[id].name);
+    } else if (SettingsList[id].values == NULL) {
         snprintf(buf,buflen,"%s:%u",
             SettingsList[id].name,
             SettingsList[id].ptr[0]);
@@ -268,7 +293,9 @@ void settings_to_string(char *buf, size_t buflen, int id) {
 // 'dir' shoild be 1 (next value) or -1 (previous value).
 uint32_t settings_change_value(int id, int dir) {
     struct UISettingsItem *si = SettingsList+id;
-    if (si->values == NULL) {
+    if (si->ptr == NULL) {
+        return si->event;   // action item -- nothing to adjust
+    } else if (si->values == NULL) {
         if (si->ptr[0] == si->min && dir == -1) return UI_EVENT_NONE;
         else if (si->ptr[0] == si->max && dir == 1) return UI_EVENT_NONE;
         si->ptr[0] += si->step * dir;
@@ -383,126 +410,129 @@ void ui_go_next_prev_game(int dir) {
     }
 }
 
-// Called when the UI is active. Handle the key presses needed to select
-// the game and change the overclock.
-//
-// Returns 1 is if some event was processed. Otherwise 0.
-#define UI_DEBOUNCING_TIME 100000
-uint32_t ui_handle_key_press(void) {
-    const uint8_t km[] = {
-        KEY_LEFT, 0, KEMPSTONE_LEFT,
-        KEY_RIGHT, 0, KEMPSTONE_RIGHT,
-        KEY_FIRE, 0, KEMPSTONE_FIRE,
-        KEY_DOWN, 0, KEMPSTONE_DOWN,
-        KEY_UP, 0, KEMPSTONE_UP,
-        KEY_END, 0, 0,
-    };
-    static absolute_time_t last_key_accepted_time = 0;
-
-    // Debouncing
-    absolute_time_t now = get_absolute_time();
-    if (now - last_key_accepted_time < UI_DEBOUNCING_TIME) return 0;
-
-    uint32_t event = UI_EVENT_NONE; // Event generated by key press, if any.
-    int key_pressed = -1;
-    for (int j = 0; ;j += 3) {
-        if (km[j] == KEY_END) break;
-        if (km[j] >= 32) continue; // Skip special codes.
-        if (get_device_button(km[j])) {
-            key_pressed = km[j+2];
-            break;
-        }
-    }
-    if (key_pressed == -1) return UI_EVENT_NONE; // No key pressed right now.
-
-    event = UI_EVENT_NAVIGATION; // If there is a more specific event, this
-                                 // will be set accordingly.
-    int value_change_dir = -1;
-    switch(key_pressed) {
-    case KEMPSTONE_UP: ui_go_next_prev_game(-1); break;
-    case KEMPSTONE_DOWN: ui_go_next_prev_game(1); break;
-    case KEMPSTONE_RIGHT: value_change_dir = 1; // fall through.
-    case KEMPSTONE_LEFT:
-        if (EMU.selected_game < 0)
-            event = settings_change_value(-EMU.selected_game-1,
-                                          value_change_dir);
-        break;
-    case KEMPSTONE_FIRE:
-        if (EMU.selected_game >= 0) {
-            // Load (or reload -- the menu overwrote the Spectrum VRAM) the
-            // selected game and start playing: one press, menu dismissed.
-            load_game(EMU.selected_game);
-            EMU.menu_active = 0;
-            EMU.menu_left_at_tick = EMU.tick;
-            event = UI_EVENT_DISMISS;
-        }
-        break;
-    }
-    last_key_accepted_time = now;
-    return event;
-}
-
-// Before writing our user interfafce inside the Spectrum video RAM, we need
-// to make sure that the colors in the area we will be using will make the
-// menu visible.
-void ui_set_area_attributes(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
-{
-    uint8_t *vmem = EMU.zx.ram[EMU.zx.display_ram_bank];
-    for (uint16_t y = y1; y <= y2 && y < 192; y += 8) {
-        for (uint16_t x = x1; x <= x2 && x < 256; x += 8) {
-            vmem[0x1800+(((y>>3)<<5)|(x>>3))] = 7;
-        }
+// Fire / Enter / Space on the highlighted item: load a game and drop into
+// play, or fire an action (Exit). Settings items do nothing on select.
+static void ui_menu_select(void) {
+    if (EMU.selected_game >= 0) {
+        load_game(EMU.selected_game);
+        EMU.menu_active = 0;
+        EMU.menu_left_at_tick = EMU.tick;
+    } else {
+        struct UISettingsItem *si = &SettingsList[-EMU.selected_game - 1];
+        if (si->event == UI_EVENT_EXIT) ikbd_request_boot_gem();
+        else if (si->event == UI_EVENT_ABOUT) EMU.about_active = 1;
     }
 }
 
-// If the menu is active, draw it.
+// Left/right on a settings item adjusts its value.
+static void ui_menu_adjust(int dir) {
+    if (EMU.selected_game < 0)
+        settings_change_value(-EMU.selected_game - 1, dir);
+}
+
+// If the menu is active, draw it into the Spectrum VRAM. Cell-aligned
+// (each 8 px row = one attribute cell row) so items can be coloured
+// independently without Spectrum attribute clash: games in white, the
+// non-file items (settings / Exit) in bright cyan, the highlighted row
+// inverted (solid colour block, black text).
 void ui_draw_menu(void) {
-    // Draw the menu in the right / top part of the screen.
-    int menu_x = 255-100;
-    int menu_w = 100;
-    int menu_y = 0;
-    int menu_h = 192/3*2;
-    int font_size = 2;
-    menu_h -= menu_h&(8*font_size-1); // Make multiple of font pixel size;
-    int vpad = 2;       // Vertical padding of text inside the box.
-    menu_h += vpad*2;   // Allow for pixels padding / top bottom.
-    menu_h &= ~0x7;     // Make multiple of 8 to avoid color clash.
+    const int menu_x = 152;             // cell-aligned (19 * 8)
+    const int menu_w = 256 - menu_x;    // to the right screen edge
+    const int menu_y = 0;
+    const int rows   = 16;              // 16 * 8 = 128 px tall
+    const int menu_h = rows * 8;
 
-    ui_fill_box(menu_x, menu_y, menu_w, menu_h, 0, 15);
-    ui_set_crop_area(menu_x+1,menu_x+menu_w-2,
-                     menu_y+1,menu_y+menu_h-2);
+    uint8_t *vmem = EMU.zx.ram[EMU.zx.display_ram_bank];
 
-    int first_game = (int)EMU.selected_game - 5;
-    int num_settings = (int)SettingsListLen;
-    if (first_game < -num_settings) first_game = -num_settings;
+    // Clear the menu region bitmap so the game behind doesn't show through.
+    ui_fill_box(menu_x, menu_y, menu_w, menu_h, 0, 0);
 
-    // Make the menu visible.
-    ui_set_area_attributes(menu_x,menu_y,menu_x+menu_w-1,menu_y+menu_h-1);
+    // Scroll so the highlighted item stays roughly centred.
+    int first = (int)EMU.selected_game - rows / 2;
+    if (first < -(int)SettingsListLen) first = -(int)SettingsListLen;
 
-    int y = menu_y+vpad; // Incremented as we write text.
-    for (int j = first_game;; j++) {
-        if (j >= (int)GamesTableSize || y > menu_y+menu_h) break;
+    ui_set_crop_area(menu_x, 255, menu_y, menu_y + menu_h - 1);
 
-        int color = j >= 0 ? 4 : 6;
-        font_size = 1;   // games same size as settings; fits more on screen
+    int y = menu_y;
+    for (int j = first; y < menu_y + menu_h; j++, y += 8) {
+        if (j >= (int)GamesTableSize) break;
+        const bool is_game = (j >= 0);
+        const bool sel = (j == EMU.selected_game);
 
-        // Highlight the currently selected game, with a box of the color
-        // of the font, and the black font (so basically the font is inverted).
-        if (j == EMU.selected_game) {
-            ui_fill_box(menu_x+2,y,menu_w-2,font_size*8,color,color);
-            color = 0;
-        }
-        if (j < 0) {
-            // Show setting item.
-            struct UISettingsItem *si = &SettingsList[-j-1];
-            char sistr[32];
-            settings_to_string(sistr,sizeof(sistr),-j-1);
-            ui_draw_string(menu_x+2,y,sistr,color,font_size);
+        // Ink colour: games white (7), non-file items bright cyan (13).
+        const uint8_t ink = is_game ? 7 : 13;
+        const uint8_t attr = (uint8_t)((ink & 7) | ((ink & 8) ? 0x40 : 0));
+        const int cy = y >> 3;
+        for (int cx = menu_x >> 3; cx < 32; cx++)
+            vmem[0x1800 + (cy << 5) + cx] = attr;
+
+        // Build the display text (game name with any ".z80" hidden).
+        char line[40];
+        if (is_game) {
+            strncpy(line, GamesTable[j].name, sizeof(line) - 1);
+            line[sizeof(line) - 1] = 0;
+            size_t n = strlen(line);
+            if (n >= 4 && line[n-4] == '.' &&
+                (line[n-3] == 'z' || line[n-3] == 'Z') &&
+                line[n-2] == '8' && line[n-1] == '0')
+                line[n-4] = 0;
         } else {
-            // Show game item.
-            ui_draw_string(menu_x+2,y,GamesTable[j].name,color,font_size);
+            settings_to_string(line, sizeof(line), -j - 1);
         }
-        y += 8*font_size;
+
+        if (sel) {
+            // Inverted highlight: solid colour block with black text.
+            ui_fill_box(menu_x, y, menu_w, 8, 1, 1);
+            ui_draw_string(menu_x + 1, y, line, 0, 1);
+        } else {
+            ui_draw_string(menu_x + 1, y, line, 1, 1);
+        }
+    }
+    ui_reset_crop_area();
+}
+
+// "About" pop-over: version + credits, centred over the screen. Opened from
+// the About menu item and dismissed by any key / joystick press. Cell-aligned
+// (8 px grid) so the title can be tinted bright cyan and the body left white.
+static const char *AboutLines[] = {
+    "MD/ZX " RELEASE_VERSION,
+    "",
+    "ZX Spectrum 48K emulator",
+    "by Neil Rackett",
+    "x.com/neilrackett",
+};
+#define ABOUT_NLINES ((int)(sizeof(AboutLines) / sizeof(AboutLines[0])))
+
+void ui_draw_about(void) {
+    const int box_cw = 26;                       // width in cells (chars)
+    const int box_x  = ((32 - box_cw) / 2) * 8;  // centred, cell-aligned
+    const int box_w  = box_cw * 8;
+    const int rows   = ABOUT_NLINES + 2;         // one padding row top + bottom
+    const int box_h  = rows * 8;
+    const int box_y  = ((24 - rows) / 2) * 8;    // centred, cell-aligned
+
+    uint8_t *vmem = EMU.zx.ram[EMU.zx.display_ram_bank];
+    ui_set_crop_area(box_x, box_x + box_w - 1, box_y, box_y + box_h - 1);
+
+    // Opaque black interior + white border (bitmap only; colours come from
+    // the attribute cells set below).
+    ui_fill_box(box_x, box_y, box_w, box_h, 0, 1);
+
+    const int cx0 = box_x >> 3, cx1 = (box_x + box_w) >> 3, cy0 = box_y >> 3;
+    for (int cy = cy0; cy < cy0 + rows; cy++)
+        for (int cx = cx0; cx < cx1; cx++)
+            vmem[0x1800 + (cy << 5) + cx] = 0x07;   // white ink, black paper
+
+    // Title row bright cyan (13 = ink 5 | bright).
+    for (int cx = cx0; cx < cx1; cx++)
+        vmem[0x1800 + ((cy0 + 1) << 5) + cx] = 0x45;
+
+    for (int i = 0; i < ABOUT_NLINES; i++) {
+        const char *s = AboutLines[i];
+        int len = (int)strlen(s);
+        if (len == 0) continue;
+        int tx = box_x + (box_w - len * 8) / 2;     // centre the line
+        ui_draw_string(tx, box_y + (i + 1) * 8, s, 1, 1);
     }
     ui_reset_crop_area();
 }
@@ -590,94 +620,12 @@ void __not_in_flash_func(update_display)(void) {
     }
 }
 
-// This function maps GPIO state to the Spectrum keyboard registers.
-// Other than that, certain keys are pressed when a given frame is
-// reached, in order to enable the joystick or things like that.
-#define HANDLE_KEYPRESS_MACRO 1
-#define HANDLE_KEYPRESS_PIN 2
-#define HANDLE_KEYPRESS_ALL (HANDLE_KEYPRESS_MACRO|HANDLE_KEYPRESS_PIN)
-void handle_zx_key_press(zx_t *zx, const uint8_t *keymap, uint32_t ticks, int flags) {
-    // This 128 bit bitmap remembers what keys we put down
-    // during this call. This is useful as sometimes key maps
-    // have multiple keys mapped to the same Spectrum key, and if
-    // some phisical key put down some Spectrum key, we don't want
-    // a successive mapping to up it up.
-    uint64_t put_down[4] = {0,0};
-    #define put_down_set(keycode) put_down[keycode>>6] |= (1ULL<<(keycode&63))
-    #define put_down_get(keycode) (put_down[keycode>>6] & (1ULL<<(keycode&63)))
-
-    for (int j = 0; ;j += 3) {
-        if (keymap[j] == KEY_END) {
-            // End of keymap reached.
-            break;
-        } else if (keymap[j] == PRESS_AT_TICK || keymap[j] == RELEASE_AT_TICK) {
-            if (keymap[j+1] != ticks) continue; // Tick number mismatch.
-            if (!(flags & HANDLE_KEYPRESS_MACRO)) continue; // No handling.
-
-            // Press/release keys when a given frame is reached.
-            if (keymap[j] == PRESS_AT_TICK) {
-                printf("Pressing '%c' at frame %d\n",keymap[j+2],ticks);
-                zx_key_down(zx,keymap[j+2]);
-            } else {
-                printf("Releasing '%c' at frame %d\n",keymap[j+2],ticks);
-                zx_key_up(zx,keymap[j+2]);
-            }
-        } else {
-            // Map the GPIO status to the ZX Spectrum keyboard
-            // registers.
-            if (!(flags & HANDLE_KEYPRESS_PIN)) continue;
-            if (!(keymap[j] & KEY_EXT)) {
-                // Normal key maps: Pico pin -> two Spectrum keys.
-                if (get_device_button(keymap[j])) {
-                    if (keymap[j+1]) {
-                        put_down_set(keymap[j+1]);
-                        zx_key_down(zx,keymap[j+1]);
-                    }
-                    if (keymap[j+2]) {
-                        put_down_set(keymap[j+2]);
-                        zx_key_down(zx,keymap[j+2]);
-                    }
-                } else {
-                    // Release.
-                    if (!put_down_get(keymap[j+1]) && keymap[j+1])
-                        zx_key_up(zx,keymap[j+1]);
-                    if (!put_down_get(keymap[j+2]) && keymap[j+2])
-                        zx_key_up(zx,keymap[j+2]);
-                }
-            } else {
-                // Extended key maps: two Pico pins -> one Spectrum key.
-                if (get_device_button(keymap[j]&0x7f) &&
-                    get_device_button(keymap[j+1]))
-                {
-                    put_down_set(keymap[j+2]);
-                    zx_key_down(zx,keymap[j+2]);
-                    return; // Return ASAP before processing normal keys.
-                } else {
-                    if (!put_down_get(keymap[j+2])) zx_key_up(zx,keymap[j+2]);
-                }
-            }
-        }
-    }
-
-    // Detect long press of left+right to return back in
-    // game selection mode.
-    {
-        #define LEFT_RIGHT_LONG_PRESS_FRAMES 30
-        static int left_right_frames = 0;
-        if (get_device_button(KEY_LEFT) && get_device_button(KEY_RIGHT)) {
-            left_right_frames++;
-            if (left_right_frames == LEFT_RIGHT_LONG_PRESS_FRAMES)
-                EMU.menu_active = 1;
-        } else {
-            left_right_frames = 0;
-        }
-    }
-}
-
 // Clear all keys. Useful when we switch game, to make sure that no
-// key downs are left from the previous keymap.
+// key downs are left from a previous game.
 void flush_zx_key_press(zx_t *zx) {
     for (int j = 0; j < KBD_MAX_KEYS; j++) zx_key_up(zx,j);
+    zx_cursor_kempston = 0;
+    zx_joystick(zx, 0);
 }
 
 // Set the audio volume by altering the PWM counter wrap value.
@@ -705,38 +653,8 @@ static int ends_with_z80(const char *name) {
 
 // SD app folder (from per-app config, default "/zx").
 static char zx_folder[64] = "/zx";
-// RAM copy of keymaps.txt; EMU.keymap_file points here.
-static char zx_keymap_buf[ZX_KEYMAP_BUF_SZ];
 
-// Load keymaps.txt from the app folder into zx_keymap_buf. If the file
-// is absent, write the firmware-default keymaps first, then use them.
-static void load_keymaps_file(void) {
-    char path[96];
-    snprintf(path, sizeof(path), "%s/keymaps.txt", zx_folder);
-
-    FIL f;
-    if (f_open(&f, path, FA_READ) != FR_OK) {
-        // Not present: create it from the built-in default.
-        if (f_open(&f, path, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
-            UINT bw = 0;
-            f_write(&f, zx_builtin_keymaps,
-                    (UINT)strlen(zx_builtin_keymaps), &bw);
-            f_close(&f);
-        }
-        strncpy(zx_keymap_buf, zx_builtin_keymaps, sizeof(zx_keymap_buf) - 1);
-        zx_keymap_buf[sizeof(zx_keymap_buf) - 1] = 0;
-        EMU.keymap_file = zx_keymap_buf;
-        return;
-    }
-
-    UINT br = 0;
-    f_read(&f, zx_keymap_buf, sizeof(zx_keymap_buf) - 1, &br);
-    zx_keymap_buf[br] = 0;
-    f_close(&f);
-    EMU.keymap_file = zx_keymap_buf;
-}
-
-// Enumerate the app folder for .z80 snapshots (and load keymaps.txt).
+// Enumerate the app folder for .z80 snapshots.
 // Returns the number of games found.
 int populate_games_list(void) {
     SettingsConfigEntry *fe =
@@ -745,8 +663,6 @@ int populate_games_list(void) {
         strncpy(zx_folder, fe->value, sizeof(zx_folder) - 1);
         zx_folder[sizeof(zx_folder) - 1] = 0;
     }
-
-    load_keymaps_file();
 
     GamesTableSize = 0;
     DIR dir;
@@ -799,11 +715,11 @@ int populate_games_list(void) {
 void init_emulator(void) {
     EMU.debug = 0;
     EMU.menu_active = 1;
+    EMU.about_active = 0;
     EMU.base_clock = 225000;   // Informational only (settings menu).
     EMU.emu_clock = 225000;
     EMU.tick = 0;
-    EMU.keymap[0] = KEY_END;
-    EMU.keymap_file = NULL;
+    EMU.cursor_as_keys = 0;    // cursor keys default to Kempston joystick
     EMU.selected_game = 0;
     EMU.loaded_game = -1;
     EMU.show_border = DEFAULT_DISPLAY_BORDERS;
@@ -813,6 +729,10 @@ void init_emulator(void) {
     EMU.partial_update = DEFAULT_DISPLAY_PARTIAL_UPDATE;
     EMU.audio_sample_wait = 300;
     ui_reset_crop_area();
+
+    // We own the ESC key: it toggles the menu. Exit to GEM is triggered
+    // from the menu's Exit item instead (ikbd_request_boot_gem).
+    ikbd_set_esc_auto_exit(false);
 
     // Publish the ZX Spectrum palette to the Atari ST shifter.
     zx_set_palette();
@@ -825,234 +745,24 @@ void init_emulator(void) {
     zx_desc.roms.zx48k.size = sizeof(dump_amstrad_zx48k_bin);
     zx_init(&EMU.zx, &zx_desc);
     EMU.zx.scanline_period = ZX_DEFAULT_SCANLINE_PERIOD;
+
+    // Register a standalone Caps Shift key at (column 0, line 0). Upstream
+    // registers it only as a modifier; the full-keyboard mapping needs to
+    // press it on its own for ST Shift. Sym Shift already has code 0x0F.
+    kbd_register_key(&EMU.zx.kbd, ZX_KEY_CAPS, 0, 0, 0);
+
+    // Caps Lock = Caps Shift + 2. No standalone code upstream, so register
+    // one at the '2' cell (column 3, line 1) with the Caps Shift modifier
+    // (mod 0), so pressing it holds both cells at once.
+    kbd_register_key(&EMU.zx.kbd, ZX_KEY_CAPSLK, 3, 1, 1);
 }
 
-// Parse line and fill current map.
-// This function turns a description in the following format into the
-// three (or six) bytes entry representing one mapping in the keymap.
-//
-// Cases we need to handle:
-//
-// 1. xul2   Extended keymap (x). ul (up+left) = keypress of 2
-// 2. lx     Standard keymap with one key press. l (left) = press x
-// 3. rz2    Standard keymap with two presses: r(right) = press z and 2
-// 4. l1|l   Kempstone keypresses are |<dir>, |lrud or |f for fire.
-// 5. @10:k1 Auto keypresses: at frame 10, press k for 1 frame.
-//
-// Note that the case "5" will actually write 6 bytes, one for the press
-// and one for the release event.
-//
-// Return the number of bytes filled (frame entries will fill six
-// bytes instead of three), or 0 on syntax error.
-int keymap_descr_to_row(char *p, uint8_t *map) {
-    char buf[16]; // An entry like @1000:|f100 is still just 12 bytes.
-
-    // Let's work on a copy of the entry, stripping everything on the
-    // right so that we just have the map line itself.
-    int idx = 0;
-    while(*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r'
-          && idx < (int)sizeof(buf)-1)
-    {
-        buf[idx++] = *p++;
-    }
-    buf[idx] = 0;
-    
-    // We have to set three bytes in total, so do the conversion
-    // in three exact steps.
-    int ext = 0; // Ext map if true (two buttons + one key).
-    int atframe = 0; // Special automatic keypress at frame entry if true.
-    int pos = 0; // Position inside the keymap line.
-    for (int j = 0; j < 3; j++) {
-        // Handle special conditions: extended and atframe entry.
-        if (j == 0) {
-            if (ext == 0 && buf[0] == 'x') {
-                ext = 1;
-                pos++;
-            } else if (atframe == 0 && buf[0] == '@') {
-                atframe = 1;
-                map[0] = PRESS_AT_TICK;
-                map[3] = RELEASE_AT_TICK;
-                pos++;
-            }
-        }
-
-        if (j == 1 && atframe) {
-            // Read the at-frame frame.
-            char *frame = buf+pos;
-            while (buf[pos] && buf[pos] != ':')
-                pos++;
-            if (buf[pos] == 0) return 0; // Syntax error.
-            buf[pos] = 0; pos++; // Pos points to key to press.
-            map[j] = atoi(frame);
-        } else if ((j == 0 && !atframe) || (j == 1 && ext)) {
-            // We read the button pin if:
-            //
-            // First keymap byte and is not at-frame entry.
-            // Second keymap byte and it is an extended map (has two pins).
-            uint8_t pin;
-            switch(buf[pos]) {
-            case 'l': pin = KEY_LEFT; break;
-            case 'r': pin = KEY_RIGHT; break;
-            case 'u': pin = KEY_UP; break;
-            case 'd': pin = KEY_DOWN; break;
-            case 'f': pin = KEY_FIRE; break;
-            default: return 0; // Syntax error.
-            }
-            if (ext && j == 0) pin |= KEY_EXT;
-            map[j] = pin;
-            pos++;
-        } else if (j == 2 || (j == 1 && !ext)) {
-            // Read the mapped Spectrum button or joystick move.
-            // Note that normal entries map to up to two buttons.
-            // The third entry is always a button press.
-            // The second entry is a button press if it's not an extended map.
-
-            // Normal maps (one pin, two buttons) may just have a single
-            // button. Stop here if that's the case.
-            if (j == 2 && buf[pos] == 0) break;
-
-            if (buf[pos] == '|') {
-                // Kempstone moves are prefixed by |
-                pos++;
-                switch(buf[pos]) {
-                case 'l': map[j] = KEMPSTONE_LEFT; break;
-                case 'r': map[j] = KEMPSTONE_RIGHT; break;
-                case 'u': map[j] = KEMPSTONE_UP; break;
-                case 'd': map[j] = KEMPSTONE_DOWN; break;
-                case 'f': map[j] = KEMPSTONE_FIRE; break;
-                default: return 0; // Syntax error.
-                }
-            } else {
-                // Normal keypress. Just take the byte given by the user.
-                if (buf[pos] == '~') buf[pos] = ' ';
-                map[j] = buf[pos];
-            }
-            pos++;
-            if (atframe) {
-                // Populate the release entry too.
-                map[5] = map[2]; // Key to release is the same.
-                map[4] = map[1] + atoi(buf+pos); // Release frame.
-            }
-        }
-    }
-    return atframe ? 6 : 3;
-}
-
-/* This function will parse the keymap file stored in the flash memory
- * (so it must be called with base overclocking, in order to read
- * from flash) and will try to match every entry with the current RAM
- * content in order to find a suitable keymap. */
-void get_keymap_for_current_game(int game_id) {
-    int got_match = 0; // State telling we got a match with RAM content.
-    uint8_t *map = EMU.keymap;
-    char *p = EMU.keymap_file;
-
-    int line = 1; // Line number inside keymap file.
-    while(1) {
-        // Discard comments and empty lines.
-        if (*p == '#' || *p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') {
-            // If we have a match, a space means our map ended. In this case
-            // return.
-            if (got_match) {
-                *map = KEY_END; // Terminate the map.
-                // Log the loaded keymap: useful when things don't
-                // work as expected.
-                map = EMU.keymap;
-                for (int j = 0; j < sizeof(EMU.keymap)/3; j++) {
-                    if (map[j*3] == KEY_END) break;
-                    printf("map entry %d: %d %d %d\n", j,
-                        map[j*3], map[j*3+1], map[j*3+2]);
-                }
-                return;
-            }
-
-            // Otherwise, discard.
-            goto next_line;
-        }
-
-        // New map. Let's see if we match with it.
-        if ((!memcmp(p,"MATCH:",6) && !got_match) ||
-            (!memcmp(p,"AND-MATCH",9) && got_match))
-        {
-            char *end = strchr(p,'\n');
-            if (*(end-1) == '\r') end--;
-            p = strchr(p,':'); p++;
-            unsigned int pattern_len = (end-p);
-
-            // Scan the Spectrum memory for a match.
-            int found = 0;
-            uint8_t *ram = (uint8_t*)EMU.zx.ram;
-            for (uint32_t j = 0; j < 49152-pattern_len; j++) {
-                if (ram[j] == p[0] && !memcmp(ram+j,p,pattern_len)) {
-                    found = 1;
-                    break;
-                }
-            }
-
-            got_match = found != 0;
-            goto next_line;
-        }
-
-        // If we reach the default map, just load it.
-        if (!memcmp(p,"DEFAULT:",8)) {
-            got_match = 1;
-            goto next_line;
-        }
-
-        // If we don't have a match, skip this map description line.
-        if (got_match == 0) goto next_line;
-
-        if (map == EMU.keymap) printf("Loading keymap at line %d\n", line);
-
-        // Keymaps may redefine scanline period for games with special
-        // requirements about the CRT timing.
-        if (!memcmp(p,"SCANLINE-PERIOD:",16)) {
-            int period = atoi(p+16);
-            if (period > 0 && period < 500 && EMU.loaded_game != game_id)
-                EMU.zx.scanline_period = period;
-            goto next_line;
-        }
-
-        // Turn this line into three bytes map entry using an helper
-        // function.
-        int used_bytes;
-        used_bytes = keymap_descr_to_row(p,map);
-        if (used_bytes == 0) {
-            int len = strchr(p,'\n') - p;
-            printf("Keymap syntax error at line %d: %.*s\n",line,len,p);
-            *map = KEY_END;
-            return;
-        }
-        map += used_bytes; // Go to the next entry;
-
-        if (map > EMU.keymap+sizeof(EMU.keymap)-3) {
-            // It is unlikely that a keymap is too long, but let's handle
-            // it in case of bugs. The -3 above is there because there are
-            // maps that can use two entries (6 bytes instead of 3 bytes).
-            map -= 3;
-            *map = KEY_END;
-            return;
-        }
-
-next_line:
-        line++;
-        if (!memcmp(p,"#END",4)) {
-            printf("No default keymap found\n");
-            return; // Stop on end of file.
-        }
-        p = strchr(p,'\n');
-        p++;
-    }
-}
-
-/* Load the specified game ID (index into GamesTable). As a side effect,
- * selects the matching keymap. */
+/* Load the specified game ID (index into GamesTable). */
 void load_game(int game_id) {
     if (game_id < 0 || game_id >= (int)GamesTableSize) return;
     struct game_entry *g = &GamesTable[game_id];
 
     flush_zx_key_press(&EMU.zx);   // No keys held across a game switch.
-    zx_kbd_mask = 0;
     EMU.tick = 0;
 
     if (EMU.loaded_game != game_id)
@@ -1073,7 +783,6 @@ void load_game(int game_id) {
     chips_range_t r = { .ptr = fb_chunked_buffer, .size = br };
     zx_quickload(&EMU.zx, r);
 
-    get_keymap_for_current_game(game_id);
     EMU.loaded_game = game_id;
 }
 
@@ -1089,74 +798,134 @@ void zxemu_init(void) {
     populate_games_list();
 }
 
-// Atari ST IKBD scancodes for the keys we map to gameplay buttons.
-#define ZX_SC_UP     0x48
-#define ZX_SC_DOWN   0x50
-#define ZX_SC_LEFT   0x4B
-#define ZX_SC_RIGHT  0x4D
-#define ZX_SC_SPACE  0x39
-#define ZX_SC_ENTER  0x1C
-#define ZX_SC_HELP   0x62
-
+// Handle one ST key event. ESC toggles the menu; while the menu is up the
+// cursor cluster drives navigation; in play everything maps onto the
+// Spectrum keyboard, with the cursor cluster acting as a Kempston joystick
+// (or the Spectrum cursor keys, per EMU.cursor_as_keys).
 void zxemu_handle_key(const ikbd_key_event_t *k) {
 #if ZX_INPUT_KEYBOARD
-    // Help key: quick access to the game / settings menu (same as the
-    // Left+Right long-press, but instant).
-    if (k->scancode == ZX_SC_HELP) {
-        if (k->is_press) EMU.menu_active = 1;
+    const uint8_t sc = k->scancode;
+    const bool press = k->is_press;
+
+    // The About pop-over is modal: any key press dismisses it and is
+    // swallowed (so ESC etc. close the pop-over rather than acting).
+    if (EMU.about_active) {
+        if (press) EMU.about_active = 0;
         return;
     }
-    int btn = -1;
-    switch (k->scancode) {
-        case ZX_SC_LEFT:  btn = ZX_BTN_LEFT;  break;
-        case ZX_SC_RIGHT: btn = ZX_BTN_RIGHT; break;
-        case ZX_SC_UP:    btn = ZX_BTN_UP;    break;
-        case ZX_SC_DOWN:  btn = ZX_BTN_DOWN;  break;
-        case ZX_SC_SPACE:
-        case ZX_SC_ENTER: btn = ZX_BTN_FIRE;  break;
-        default: break;
+
+    // ESC toggles the game / settings menu. We own the ESC key here
+    // (auto-exit is disabled at init); exit to GEM is the menu's Exit item.
+    if (sc == ST_SC_ESC) {
+        if (press) {
+            EMU.menu_active = !EMU.menu_active;
+            if (!EMU.menu_active) EMU.menu_left_at_tick = EMU.tick;
+        }
+        return;
     }
-    if (btn >= 0) {
-        if (k->is_press) zx_kbd_mask |= (1u << btn);
-        else             zx_kbd_mask &= ~(1u << btn);
+
+    // Menu mode: the keyboard drives navigation, nothing reaches the ZX.
+    if (EMU.menu_active) {
+        if (!press) return;
+        switch (sc) {
+            case ST_SC_UP:      ui_go_next_prev_game(-1); break;
+            case ST_SC_DOWN:    ui_go_next_prev_game(1);  break;
+            case ST_SC_LEFT:    ui_menu_adjust(-1); break;
+            case ST_SC_RIGHT:   ui_menu_adjust(1);  break;
+            case ST_SC_ENTER:
+            case ST_SC_SPACE:
+            case ST_SC_INSERT:
+            case ST_SC_CLRHOME: ui_menu_select(); break;
+            default: break;
+        }
+        return;
     }
+
+    // Play mode. The cursor cluster is the Kempston joystick by default, or
+    // the Spectrum cursor keys (Caps Shift + 5..8) when EMU.cursor_as_keys.
+    switch (sc) {
+        case ST_SC_UP: case ST_SC_DOWN: case ST_SC_LEFT: case ST_SC_RIGHT:
+            if (EMU.cursor_as_keys) {
+                uint8_t code = (sc == ST_SC_UP)   ? ZX_KEY_CUP   :
+                               (sc == ST_SC_DOWN) ? ZX_KEY_CDOWN :
+                               (sc == ST_SC_LEFT) ? ZX_KEY_CLEFT : ZX_KEY_CRIGHT;
+                if (press) zx_key_down(&EMU.zx, code);
+                else       zx_key_up(&EMU.zx, code);
+            } else {
+                uint8_t bit = (sc == ST_SC_UP)   ? ZX_JOYSTICK_UP   :
+                              (sc == ST_SC_DOWN) ? ZX_JOYSTICK_DOWN :
+                              (sc == ST_SC_LEFT) ? ZX_JOYSTICK_LEFT : ZX_JOYSTICK_RIGHT;
+                if (press) zx_cursor_kempston |=  bit;
+                else       zx_cursor_kempston &= ~bit;
+            }
+            return;
+        case ST_SC_INSERT:
+        case ST_SC_CLRHOME:
+            // Both keys are fire (Kempston button) -- but only in the
+            // joystick cursor mode. In "keys" mode the cursors are Spectrum
+            // keys and there's no Kempston, so a press does nothing. Release
+            // always clears, so the bit can't stick if the mode changed
+            // while it was held.
+            if (press) {
+                if (!EMU.cursor_as_keys) zx_cursor_kempston |= ZX_JOYSTICK_BTN;
+            } else {
+                zx_cursor_kempston &= ~ZX_JOYSTICK_BTN;
+            }
+            return;
+        default:
+            break;
+    }
+
+    // Everything else maps positionally onto the Spectrum keyboard.
+    uint8_t zk = st2zx[sc & 0x7f];
+    if (zk == 0) return;
+    if (press) zx_key_down(&EMU.zx, zk);
+    else       zx_key_up(&EMU.zx, zk);
 #else
     (void)k;
 #endif
 }
 
 void zxemu_render_frame(void) {
-    // Compose this frame's button state: keyboard | ST joystick.
-    // get_device_button() reads zx_input_mask.
-    zx_input_mask = zx_kbd_mask;
-    {
-        uint8_t j = ikbd_get_joystick();  // bit0 up,1 down,2 left,3 right,7 fire
-        if (j & 0x01) zx_input_mask |= (1u << ZX_BTN_UP);
-        if (j & 0x02) zx_input_mask |= (1u << ZX_BTN_DOWN);
-        if (j & 0x04) zx_input_mask |= (1u << ZX_BTN_LEFT);
-        if (j & 0x08) zx_input_mask |= (1u << ZX_BTN_RIGHT);
-        if (j & 0x80) zx_input_mask |= (1u << ZX_BTN_FIRE);
-    }
+    uint8_t joy = ikbd_get_joystick();  // bit0 up,1 down,2 left,3 right,7 fire
+    static uint8_t prev_joy = 0;
 
-    // Menu input (game selection / settings). ui_handle_key_press()
-    // itself loads the selected game on FIRE and clears menu_active.
-    if (EMU.menu_active) {
-        ui_handle_key_press();
+    if (EMU.about_active) {
+        // Modal pop-over: any joystick press dismisses it (keyboard is
+        // handled per-event in zxemu_handle_key).
+        if (joy & (uint8_t)~prev_joy) EMU.about_active = 0;
+    } else if (EMU.menu_active) {
+        // Drive the menu from the physical ST joystick too, edge-triggered
+        // so one push is one step (the keyboard path is per-event above).
+        uint8_t edge = joy & (uint8_t)~prev_joy;
+        if (edge & 0x01) ui_go_next_prev_game(-1);   // up
+        if (edge & 0x02) ui_go_next_prev_game(1);    // down
+        if (edge & 0x04) ui_menu_adjust(-1);         // left
+        if (edge & 0x08) ui_menu_adjust(1);          // right
+        if (edge & 0x80) ui_menu_select();           // fire
+    } else {
+        // Play: Kempston = cursor-key contribution | physical ST joystick.
+        uint8_t kemp = zx_cursor_kempston;
+        // Ignore the physical joystick for a few frames after the menu
+        // closes so the fire that picked a game doesn't leak into play.
+        if (EMU.tick >= EMU.menu_left_at_tick + 10) {
+            if (joy & 0x01) kemp |= ZX_JOYSTICK_UP;
+            if (joy & 0x02) kemp |= ZX_JOYSTICK_DOWN;
+            if (joy & 0x04) kemp |= ZX_JOYSTICK_LEFT;
+            if (joy & 0x08) kemp |= ZX_JOYSTICK_RIGHT;
+            if (joy & 0x80) kemp |= ZX_JOYSTICK_BTN;
+        }
+        zx_joystick(&EMU.zx, kemp);
     }
-
-    // Map the live buttons onto the Spectrum keyboard for this frame.
-    // While the menu is up (or was just dismissed) only the automatic
-    // frame-triggered macros run, not the physical buttons.
-    int kflags = HANDLE_KEYPRESS_ALL;
-    if (EMU.menu_active || EMU.tick < EMU.menu_left_at_tick + 10)
-        kflags = HANDLE_KEYPRESS_MACRO;
-    handle_zx_key_press(&EMU.zx, EMU.keymap, EMU.tick, kflags);
+    prev_joy = joy;
 
     // Run the Spectrum for one frame's worth of ticks.
     zx_exec(&EMU.zx, FRAME_USEC);
 
-    // Draw the menu over the emulated screen if it is active.
-    if (EMU.menu_active) ui_draw_menu();
+    // Draw the menu over the emulated screen, or the About pop-over on top
+    // of it (the pop-over replaces the menu so nothing peeks out beside it).
+    if (EMU.about_active)     ui_draw_about();
+    else if (EMU.menu_active) ui_draw_menu();
 
     // Toggle the FLASH phase ~twice per second (every 16 frames).
     if ((EMU.tick & 0x0f) == 0) zx_blink_phase ^= 1u;

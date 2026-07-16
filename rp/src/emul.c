@@ -54,7 +54,7 @@ static bool cart_check(const char *stage) {
 }
 
 void emul_start() {
-  // Games + keymaps.txt live in the app folder (per-app config
+  // Games live in the app folder (per-app config
   // ACONFIG_PARAM_FOLDER, default "/zx" from aconfig.c). The default is
   // the right value -- a fresh config sector gets "/zx" and no MD/ZX
   // build ever stored anything else -- so no runtime "healing" needed.
@@ -95,7 +95,7 @@ void emul_start() {
   // installed after the emulator core is up (it reads emulator state).
   audio_init();
 
-  // SD card -- best effort. Games + keymaps.txt live in `folderName`.
+  // SD card -- best effort. Games live in `folderName`.
   FATFS fsys;
   cart_check("pre-sd");
   bool sd_ok = sdcard_initFilesystem(&fsys, folderName) == SDCARD_INIT_OK;
@@ -117,6 +117,8 @@ void emul_start() {
   audio_set_fill_callback(zxemu_audio_fill);
 
   // Main loop:
+  //   0. Re-arm the command sentinel to NOP (makes an exit's BOOT_GEM a
+  //      one-shot so it doesn't re-trigger on the next ST reset).
   //   1. Drain the ROM3 ring -> IKBD demux + VBL frame-sync.
   //   2. Run the IKBD demux.
   //   3. Forward decoded key events to the emulator (button mapping).
@@ -124,6 +126,7 @@ void emul_start() {
   //   5. Refill the YM audio buffer.
   DPRINTF("Entering main loop\n");
   while (true) {
+    ikbd_clear_command();
     fb_pump_rom3();
     ikbd_pump();
 

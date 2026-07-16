@@ -1,6 +1,9 @@
-/**
+/*
+ * Copyright (C) 2026 Neil Rackett
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
  * File: ikbd.c
- * Description: IKBD keyboard ingest + demux (keyboard-only).
+ * Description: IKBD keyboard + joystick ingest + demux.
  *
  * Raw byte ring filled by ikbd_consume_rom3_sample (called directly
  * from `commemul_poll(ikbd_consume_rom3_sample)` in the emul.c main
@@ -95,6 +98,29 @@ void ikbd_set_esc_auto_exit(bool enabled) {
   s_esc_auto_exit = enabled;
 }
 
+void ikbd_request_boot_gem(void) {
+  /* Pre-swap the longword halves so m68k's move.l sees the expected
+   * value (cart_asM68kLong). userfw's VBL loop polls this sentinel and
+   * exits to GEM on match. */
+  *((volatile uint32_t *)((uintptr_t)&__rom_in_ram_start__ +
+                          CART_CMD_SENTINEL_OFFSET)) =
+      cart_asM68kLong(CART_CMD_BOOT_GEM);
+}
+
+void ikbd_clear_command(void) {
+  /* Re-arm the command sentinel to NOP. ikbd_request_boot_gem() posts
+   * BOOT_GEM here for userfw to consume, but the m68k can't write it
+   * back (the cart region is RP-owned) and the RP only zeroes it at
+   * boot. Left set, a BOOT_GEM from an exit persists across an ST reset:
+   * the re-run userfw re-reads it and quits to GEM instead of running.
+   * Called once per main-loop iteration -- BOOT_GEM survives the single
+   * frame between the exit write and userfw's VBL read (fb_publish
+   * blocks until that read), then this wipes it. */
+  *((volatile uint32_t *)((uintptr_t)&__rom_in_ram_start__ +
+                          CART_CMD_SENTINEL_OFFSET)) =
+      cart_asM68kLong(CART_CMD_NOP);
+}
+
 size_t ikbd_ring_count(void) {
   uint8_t h = s_head;
   uint8_t t = s_tail;
@@ -134,9 +160,7 @@ static void push_key(uint8_t scancode, bool is_press) {
       s_esc_press_us = 0;
       if (s_esc_auto_exit && press != 0u &&
           (time_us_32() - press) < IKBD_ESC_RELEASE_TIMEOUT_US) {
-        *((volatile uint32_t *)((uintptr_t)&__rom_in_ram_start__ +
-                                CART_CMD_SENTINEL_OFFSET)) =
-            cart_asM68kLong(CART_CMD_BOOT_GEM);
+        ikbd_request_boot_gem();
       }
     }
   }

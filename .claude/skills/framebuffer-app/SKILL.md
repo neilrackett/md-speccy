@@ -43,13 +43,12 @@ double-buffering. `fb_publish()` blocks on the ST's VBL, so one call per
 loop paces the app to 50 Hz.
 
 `README.md` is the human guide; `CLAUDE.md` is the architecture
-deep-dive; `examples/hello_text/` is a minimal working app.
+deep-dive.
 
 ## Starting a fresh app
 
-**Quick path:** `examples/hello_text/apply.sh` does all of the below — it
-backs up `rp/` to `rp.bak`, deletes the demo/menu files, and installs a
-minimal `emul.c` + `CMakeLists.txt`. The manual steps:
+Convert the template into your app (back up `rp/` first if you want an
+easy revert):
 
 1. **Delete the demos**: `rp/src/demo_*.c` (5 files), `rp/src/include/demo.h`,
    and the asset headers (`sidecart_logo.h`, `sidecart_text.h`,
@@ -64,8 +63,6 @@ minimal `emul.c` + `CMakeLists.txt`. The manual steps:
    `audio_render_frame()` calls. Drop `#include "demo.h"`.
 4. **`desc/app.json`**: set your `uuid` (must match the UUID passed to
    `build.sh`).
-
-`examples/hello_text/emul.c` is a ready-made stripped `emul.c` to copy.
 
 ## The API (keep these modules; they are your API)
 

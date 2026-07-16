@@ -34,8 +34,9 @@ void zxemu_init(void);
 void zxemu_render_frame(void);
 
 /* Feed one decoded Atari ST key event (press/release) to the emulator.
- * Maps cursor keys + space to the gameplay buttons. No-op when
- * keyboard input is compiled out. */
+ * ESC toggles the menu; otherwise keys map onto the Spectrum keyboard,
+ * with the cursor cluster acting as a Kempston joystick (or the Spectrum
+ * cursor keys). No-op when keyboard input is compiled out. */
 void zxemu_handle_key(const ikbd_key_event_t *k);
 
 /* Per-VBL YM fill callback: converts the emulated 1-bit beeper into

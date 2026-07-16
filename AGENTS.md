@@ -86,10 +86,10 @@ and it's read from the environment in `rp/src/CMakeLists.txt`:
 Override from the root Makefile, e.g. `ZX_INPUT_KEYBOARD=0 make build`.
 
 (The earlier `ZX_AUDIO_YM`, `ZX_GAMES_FROM_SD` and `ZX_INPUT_JOYSTICK`
-gates were removed once those paths were confirmed working on hardware;
+gates were removed once those paths were confirmed working on hardware.
 `builtin_game.h` is still used — the embedded demo is seeded into an
-empty `/zx` folder — and
-`builtin_keymaps.h` is the firmware-default `keymaps.txt`.)
+empty `/zx` folder. The old `builtin_keymaps.h` / `keymaps.txt` system
+was dropped when input moved to a direct ST→Spectrum keyboard mapping.)
 
 ### Build gotchas
 
@@ -174,9 +174,18 @@ VBL** — one call per loop paces the app to 50 Hz.
 4. **RP demux** (`ikbd.c` `ikbd_pump`) classifies bytes: `$00..$7F` press,
    `$80..$F1` release; `$FE/$FF` (one stick) / `$FD` (both) joystick
    packets are framed into `s_joy_state` (a small pending-byte counter).
-5. **ESC exit** — ESC press+release within 200 ms writes
-   `CART_CMD_BOOT_GEM` to the sentinel; the m68k VBL loop polls it and
-   exits to GEM.
+5. **Exit to GEM** — `ikbd_request_boot_gem()` writes `CART_CMD_BOOT_GEM`
+   to the sentinel; the m68k VBL loop polls it and exits to GEM. (The
+   built-in ESC press+release auto-exit still exists but MD/ZX disables
+   it — see the input section; the menu's Exit item drives this instead.)
+   **The sentinel is a one-shot:** the m68k can't write the RP-owned cart
+   region and the RP only zeroes it at boot, so a `BOOT_GEM` left set
+   would persist across an ST reset and re-trigger the exit (userfw
+   re-reads it → straight back to GEM). The main loop calls
+   `ikbd_clear_command()` (re-arm to `CART_CMD_NOP`) every iteration;
+   `BOOT_GEM` survives the one frame between the exit write and userfw's
+   VBL read (`fb_publish` blocks until that read), then the next
+   iteration wipes it, so a later reset auto-boots MD/ZX cleanly.
 
 ### Audio pipeline (YM2149)
 
@@ -251,16 +260,16 @@ the c2p worker.**
 - `rp/src/zx/` — **vendored emulator core**, kept close to upstream
   (MIT/zlib): `z80.h`, `zx.h`, `mem.h`, `kbd.h`, `chips_common.h`,
   `clk.h`, `zx-roms.h`. Modifications are marked `MODIFIED (md-zx)`.
-- `rp/src/zx/device_config.h` — replaces zx2040's per-board header:
-  buttons are abstract IDs read from `zx_input_mask` via
-  `get_device_button(id)`; `SPEAKER_PIN`, `st77_*` display metrics.
+- `rp/src/zx/device_config.h` — replaces zx2040's per-board header. The
+  button/keymap indirection was dropped (input is applied directly to the
+  emulator in `zxemu.c`), so this now only carries `SPEAKER_PIN` and the
+  `st77_*` display metrics the core and UI still reference.
 - `rp/src/zx/zx_config.h` — input-gate `#ifndef` fallbacks.
-- `rp/src/zx/builtin_game.h`, `builtin_keymaps.h` — generated: the
-  embedded demo `.z80` (seeded into an empty `/zx`) and the default
-  `keymaps.txt`.
+- `rp/src/zx/builtin_game.h` — generated: the embedded demo `.z80`,
+  seeded into an empty `/zx`.
 - `rp/src/zxemu.c` — **the port**: the emulator front-end (ported from
-  zx2040's `zx.c`). Owns the `EMU` state, UI/menu, keymap parser, the
-  VRAM→FB decode, input mapping, audio fill, SD loading. Includes the
+  zx2040's `zx.c`). Owns the `EMU` state, UI/menu, the ST→Spectrum key
+  mapping, the VRAM→FB decode, audio fill, SD loading. Includes the
   emulator core with `#define CHIPS_IMPL`.
 - `rp/src/include/zxemu.h` — the 4 entry points `emul.c` calls:
   `zxemu_init`, `zxemu_render_frame`, `zxemu_handle_key`,
@@ -271,7 +280,7 @@ the c2p worker.**
 | zx2040 | Replaced with |
 | --- | --- |
 | ST77xx display driver | `update_display()` decodes 256×192 VRAM → `fb_chunked_buffer` at (32,4), one palette index/pixel, then `fb_publish()` |
-| GPIO buttons | `get_device_button(id)` reads `zx_input_mask`, set from ST keyboard/joystick |
+| GPIO buttons | `zxemu_handle_key()` applies ST keys directly via `zx_key_down/up`; the cursor cluster + ST joystick drive `zx_joystick()` (Kempston) |
 | PWM beeper on Core 1 | `zxemu_audio_fill` → YM (Core 1 freed for c2p) |
 | flash game blob | FatFs enum of `/zx`, `.z80` loaded via `zx_quickload` |
 
@@ -287,27 +296,68 @@ frame counter's blink phase is set), and writes the palette index to
 the ST shifter palette in `zx_set_palette()` (`zxpalette` is `0x00BBGGRR`
 → `PALETTE_RGB` 3-bit channels).
 
-### Input
+### Input (direct ST→Spectrum mapping — replaced the keymap system)
 
-`zxemu_handle_key()` maps ST scancodes (Up `$48`, Down `$50`, Left `$4B`,
-Right `$4D`, Space `$39`, Return `$1C`) to button bits in `zx_kbd_mask`.
-`zxemu_render_frame()` composes `zx_input_mask = zx_kbd_mask | joystick`
-each frame, so `get_device_button()` — and thus zx2040's entire per-game
-keymap/macro parser — works unchanged. Kempston key codes are
-`$FB..$FF`.
+The zx2040 per-game keymap/macro parser and the `get_device_button`
+abstraction were removed. `zxemu_handle_key()` now applies each ST key
+event straight to the emulator:
 
-### Joystick (always on, hardware-confirmed)
+- **ESC** toggles the game/settings menu (we own ESC — `ikbd.c`'s
+  auto-exit-to-GEM is disabled at init via `ikbd_set_esc_auto_exit(false)`;
+  exit-to-GEM is now the menu's **Exit** item, which calls
+  `ikbd_request_boot_gem()`).
+- **Menu active** → the cursor cluster navigates (↑↓ move, ←→ adjust a
+  setting) and Return/Space/Insert/Clr-Home select; nothing reaches the
+  Spectrum. The physical ST joystick navigates too (edge-detected in
+  `zxemu_render_frame`).
+- **In play** → the positional table `st2zx[128]` maps ST scancodes to
+  Spectrum key codes 1:1 (letters/digits), with **Shift→Caps Shift**,
+  **Alt→Symbol Shift**, **Backspace/Delete→Delete**. Punctuation
+  (`- = ; ' , . /`) maps to the ASCII symbol printed on the ST keycap; the
+  matrix registered those codes with the Sym Shift modifier, so it applies
+  Sym Shift automatically (one ST key = the combo). Applied via
+  `zx_key_down/zx_key_up`. Two combos have no standalone matrix code
+  upstream, so `init_emulator` registers them: **Caps Shift** at
+  `ZX_KEY_CAPS 0x88` (`kbd_register_key(..., 0,0,0)` — the Caps Shift cell)
+  for ST Shift, and **Caps Lock** at `ZX_KEY_CAPSLK 0x89`
+  (`kbd_register_key(..., 3,1,1)` — the '2' cell + Caps Shift modifier).
+  Sym Shift already has code `0x0F`.
+- The **cursor cluster** is the Kempston joystick by default, or the
+  Spectrum cursor keys (Caps Shift+5..8) when the **cursor** setting is
+  `keys`. Held directions accumulate in `zx_cursor_kempston`.
+- **Insert / Clr-Home** are fire (Kempston button), but only in the
+  joystick cursor mode — in `keys` mode there's no Kempston, so they're
+  ignored (release always clears the bit, so it can't stick across a mode
+  change).
+
+`zxemu_render_frame()` composes the Kempston mask each frame as
+`zx_cursor_kempston | (physical ST joystick)` and calls
+`zx_joystick(&EMU.zx, mask)` (Kempston → `joy_joymask`, OR'd with
+`kbd_joymask` by the ULA). The physical joystick is ignored for ~10 ticks
+after the menu closes so the fire that picked a game doesn't leak into
+play.
+
+### Joystick ingest (always on, hardware-confirmed)
 
 `ikbd.c` runs a small state machine consuming `$FE/$FF` (one stick) /
 `$FD` (both) packets into `s_joy_state` (bit0 up,1 down,2 left,3 right,7
-fire), exposed via `ikbd_get_joystick()`; `zxemu_render_frame` ORs those
-into `zx_input_mask` each frame. The m68k side is the interrupt-driven
-ACIA handler in the IKBD pipeline above (`userfw_acia_irq` + `$12`/`$14`
-sends). This is what made it reliable: the earlier version *polled* the
-ACIA inside the blit and lost bytes, shredding the multi-byte packets —
-the interrupt handler reads every byte the instant it arrives, so the
-framing holds. Works on hardware (keyboard + joystick together). If the
-byte loss ever regresses, the symptom is stuck/phantom directions.
+fire), exposed via `ikbd_get_joystick()`; `zxemu_render_frame` folds those
+bits into the Kempston mask (in play) or into menu navigation (in menu).
+The m68k side is the interrupt-driven ACIA handler in the IKBD pipeline
+above (`userfw_acia_irq` + `$12`/`$14` sends). This is what made it
+reliable: the earlier version *polled* the ACIA inside the blit and lost
+bytes, shredding the multi-byte packets — the interrupt handler reads
+every byte the instant it arrives, so the framing holds. Works on
+hardware (keyboard + joystick together). If the byte loss ever regresses,
+the symptom is stuck/phantom directions.
+
+### About pop-over
+
+The **About** menu item sets `EMU.about_active`; `ui_draw_about()` renders
+a centred, cell-aligned box (version from the `RELEASE_VERSION` compile
+macro + credits) over the menu. It's modal — any key (in
+`zxemu_handle_key`) or joystick press (in `zxemu_render_frame`) dismisses
+it back to the menu.
 
 ### Audio
 
@@ -317,15 +367,16 @@ the 1-bit beeper into `zx.audiobuf` during `zx_exec` (enabled because
 fill and maps each to full/zero YM volume (`ZX_YM_VOLUME`) on both
 channels. Approximate ("recognisable, not hi-fi").
 
-### SD games / keymaps
+### SD games
 
 `/zx` (config `ACONFIG_PARAM_FOLDER`). `populate_games_list()` enumerates
 `.z80`; `load_game()` reads a snapshot **into the 64 KB
 `fb_chunked_buffer`** (borrowed as a transient load buffer — it's
 overwritten by the next render, so no permanent allocation) then
-`zx_quickload`. `keymaps.txt` is read into `zx_keymap_buf` (4 KB), or the
-firmware default is written to the card if absent. `EMU.keymap_file`
-points at that buffer (SD) or `builtin_keymaps` (SD-off).
+`zx_quickload`. No game auto-loads: boot leaves the menu active so the
+user always picks. If `/zx` has no `.z80` files, the embedded
+`builtin_game.h` demo is seeded there on first boot. (There is no keymap
+file any more — input is the direct mapping described above.)
 
 ### RAM budget — CRITICAL, read before adding statics
 

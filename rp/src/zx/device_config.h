@@ -11,13 +11,13 @@
  * On this target there is no ST77xx display and no GPIO buttons:
  *   - the "display" is the 320x200 framebuffer that the firmware blits
  *     to the Atari ST each VBL (see fb_chunked.h), and
- *   - the "buttons" are abstract IDs whose state is driven from Atari
- *     ST keyboard / joystick input decoded on the RP2040.
+ *   - input is decoded from the Atari ST keyboard / joystick on the
+ *     RP2040 and applied directly to the emulator in zxemu.c, via
+ *     zx_key_down/zx_key_up (Spectrum keys) and zx_joystick (Kempston).
  *
- * The upstream emulator core reaches input solely through the
- * get_device_button(id) macro, so redefining it here to read a
- * software bitmask preserves the entire keymap / macro system
- * unchanged.
+ * The abstract-button / keymap indirection from upstream zx2040 was
+ * dropped in favour of that direct mapping, so this header only carries
+ * the audio and display metrics the core and UI still reference.
  */
 
 #ifndef ZX_DEVICE_CONFIG_H
@@ -26,34 +26,6 @@
 #include <stdint.h>
 
 #include "zx_config.h"
-
-/* ------------------------------------------------------------------ */
-/* Buttons                                                            */
-/* ------------------------------------------------------------------ */
-
-/* The five gameplay "buttons" are abstract bit positions in
- * zx_input_mask (bit N set => button N held). The upstream keymap
- * parser and handler reference these as KEY_* pin identifiers. Values
- * must stay below 0x80 so they never collide with the keymap control
- * codes KEY_EXT (0x80), RELEASE_AT_TICK (0xFD), PRESS_AT_TICK (0xFE)
- * or KEY_END (0xFF). */
-#define ZX_BTN_LEFT  0
-#define ZX_BTN_RIGHT 1
-#define ZX_BTN_FIRE  2
-#define ZX_BTN_UP    3
-#define ZX_BTN_DOWN  4
-
-#define KEY_LEFT  ZX_BTN_LEFT
-#define KEY_RIGHT ZX_BTN_RIGHT
-#define KEY_FIRE  ZX_BTN_FIRE
-#define KEY_UP    ZX_BTN_UP
-#define KEY_DOWN  ZX_BTN_DOWN
-
-/* Live button state, updated by zxemu_handle_key() from decoded Atari
- * ST input. Defined in zxemu.c. */
-extern uint32_t zx_input_mask;
-
-#define get_device_button(id) ((zx_input_mask >> (id)) & 1u)
 
 /* ------------------------------------------------------------------ */
 /* Audio                                                              */
