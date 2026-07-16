@@ -1,8 +1,8 @@
 {
   "uuid": "<APP_UUID>",
-  "name": "MD/ZX",
-  "description": "ZX Spectrum 48K emulator for the Atari ST",
-  "image": "https://placehold.co/256x256/png",
+  "name": "MD/ZX: ZX Spectrum 48K",
+  "description": "ZX Spectrum 48K emulator for the Atari ST. For more information, visit <a href=\"https://github.com/neilrackett/md-zx\">https://github.com/neilrackett/md-zx</a>.",
+  "image": "https://atarist.neilrackett.com/<APP_UUID>.png",
   "tags": [
     "Emulator",
     "ZX Spectrum",
@@ -14,7 +14,7 @@
     "MegaST",
     "MegaSTE"
   ],
-  "binary": "https://atarist.sidecartridge.com/<APP_UUID>-<APP_VERSION>.uf2",
+  "binary": "https://atarist.neilrackett.com/<APP_UUID>.uf2",
   "md5": "<BINARY_MD5_HASH>",
   "version": "<APP_VERSION>"
 }

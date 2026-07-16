@@ -1,26 +1,37 @@
-# MD/ZX: ZX Spectrum for the Atari ST
+# MD/ZX: ZX Spectrum emulator for the Atari ST
+
+<img alt="Jetpac running on MD/ZX" src="desc/jetpac.webp" width="640" />
 
 Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by [Neil Rackett](https://x.com/neilrackett)
 
 ## Introduction
 
-MD/ZX turns your SidecarT into a **ZX Spectrum 48K** running on your Atari ST — a port of Andre Weissflog's `chips` emulator (via Salvatore Sanfilippo's [zx2040](https://github.com/antirez/zx2040)) onto the SidecarTridge framebuffer template.
+MD/ZX turns your SidecarT into a ZX Spectrum 48K running on your Atari ST!
 
-The whole Spectrum runs on the RP2040 inside the cartridge:
+Any game in `.z80` format can be played using cursor keys and space, which are mapped to the Kempston joystick and Spectrum keys through zx2040's per-game keymap system, just drop them into the `/zx` folder of your SD card.
 
-- The Spectrum's 256×192 screen is drawn 1:1, centred in the ST's 320×200 display, with a coloured border and the full 15-colour palette (BRIGHT and FLASH included).
-- The **Atari ST keyboard** drives the games — cursor keys + space, mapped to the Kempston joystick and Spectrum keys through zx2040's per-game keymap system.
-- The **1-bit beeper** plays out the YM2149.
-- **Games load from the SD card** — drop `.z80` snapshots in a folder and pick them from an on-screen menu.
+Don't have any games yet? Don't worry, MD/ZX comes with a built-in demo and default keymaps.
 
-No display board, no buttons, no soldering: the ST *is* the screen, keyboard and speaker.
+Ported from Andre Weissflog's [`chips`](https://github.com/floooh/chips), via Salvatore Sanfilippo's [zx2040](https://github.com/antirez/zx2040), so a massive thank you to both of them for their fantastic work!
 
 ## Controls
 
-- **Cursor keys + Space** — play (mapped per-game to Kempston / Spectrum keys).
-- **Left + Right held together** — open the game/settings menu.
-- **In the menu** — up/down to choose a game or setting, Space/Return to select.
-- **ESC** — quit back to GEM.
+|            | Key                      | Action                                      |
+| ---------- | ------------------------ | ------------------------------------------- |
+| Menu       | ↑ ↓                      | Choose a game or setting                    |
+|            | Space / Return (in menu) | Select                                      |
+| Play       | ↑ ↓ ← → Space            | Mapped per-game to Kempston / Spectrum keys |
+|            | Help                     | Open the game / settings menu               |
+|            | ← → (held together)      | Open the game / settings menu               |
+| Everywhere | ESC                      | Quit back to GEM                            |
+
+## Installation
+
+1. Download the latest `.uf2` and `.json` from the [releases page](https://github.com/neilrackett/md-zx/releases).
+2. Copy both files to the `/apps` folder of your SidecarT's microSD card.
+3. Optionally, copy your `.z80` Spectrum games into a `/zx` folder on the same microSD card.
+4. On the Booster screen, press ESC for the app list and select MD/ZX.
+5. To return to Booster, power on your ST while holding the SELECT button on your SidecarT.
 
 ## Hardware requirements
 
@@ -29,37 +40,25 @@ No display board, no buttons, no soldering: the ST *is* the screen, keyboard and
 - A microSD card for your games
 - Raspberry Pi Debug Probe or Picoprobe for flashing/debugging (optional, for development)
 
-## Installation
-
-1. Download the latest `.uf2` and `.json` from the [releases page](https://github.com/neilrackett/md-zx/releases).
-2. Copy both files to the `/apps` folder of your SidecarT's microSD card.
-3. Create a `/zx` folder on the same card and copy your `.z80` Spectrum snapshots into it.
-4. On the Booster screen, press ESC for the app list and select MD/ZX.
-5. To return to Booster, power on your ST while holding the SELECT button on your SidecarT.
-
-On first boot MD/ZX writes a default `keymaps.txt` into `/zx` (see **Games and keymaps** below). If the folder is empty the emulator still boots to the Spectrum ROM screen so you know it's alive.
-
 ## Games and keymaps
 
-Games are `.z80` snapshots (v1, v2 and v3 headers, compressed) placed in the `/zx` folder. Names are cosmetic — the emulator matches keymaps by scanning snapshot memory for known strings, so any snapshot works.
+On first boot, MD/ZX writes a default `keymaps.txt` and a simple demo into `/zx` for you.
 
-`/zx/keymaps.txt` maps the ST's five controls (cursor keys + space) to Spectrum keys or Kempston moves, per game, with optional frame-triggered macros for auto-selecting the joystick or redefining keys. The file format is inherited from zx2040 — MD/ZX writes a starter file on first boot; edit it on the card to add your own games. No recompile needed.
+Any games in `.z80` format are supported, just copy them into the `/zx` folder on your SD card for MD/ZX to find them; there are loads of classic games currently available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) if you don't have any already.
+
+`/zx/keymaps.txt` maps cursor keys + space to Spectrum keys or Kempston moves, per game, with optional frame-triggered macros for auto-selecting the joystick or redefining keys. The file format is inherited from [zx2040](https://github.com/antirez/zx2040) — MD/ZX writes a starter file on first boot;
 
 ## How it works
 
 The RP2040 runs the full Spectrum on Core 0 and decodes its video memory straight into the framebuffer; the m68k blits that to the ST screen every VBL. Input and audio ride the cartridge bus in both directions.
 
-```
-Atari ST (68000)                         RP2040 (SidecarTridge)
-────────────────                         ──────────────────────
-VBL: blit cart FB → ST screen  ◄──$FA8300──  Core 0: Z80 emulation (chips core)
-                                                  ↓  256×192 VRAM → chunked FB @ (32,4)
-IKBD keyboard bytes            ──$FB82xx──►   demux → button mask → Kempston/keys
+IKBD keyboard bytes ──$FB82xx──►   demux → button mask → Kempston/keys
                                              Core 1: chunky → ST planar (c2p)
-Timer-B: write YM volumes      ◄──$FA4100──  beeper → (vA,vB) pairs, filled per VBL
-```
+Timer-B: write YM volumes      ◄──$FA4100── beeper → (vA,vB) pairs, filled per VBL
 
-The Spectrum is 50 Hz PAL and so is the ST's VBL, so one emulated frame maps to one blit. You develop nothing on the ST — MD/ZX is a self-contained app; the ST just provides the screen, keyboard and YM.
+````
+
+MD/ZX runs almost entirely on the SidecarT, with the ST providing the screen, keyboard and sound.
 
 ## Building
 
@@ -72,27 +71,15 @@ make debug
 
 # Open a UART console on the debug probe
 make uart
-```
+````
 
-Functionality is split into compile-time **phase gates** so each capability can be tested on its own — pass them to CMake, e.g.:
+Display, audio and SD game loading are always on. The one optional feature is the (experimental) ST joystick, enabled at build time:
 
 ```bash
-cmake --preset pico_w-release -DZX_GAMES_FROM_SD=0   # run the baked-in demo, no SD needed
-cmake --preset pico_w-release -DZX_AUDIO_YM=0        # silent
-cmake --preset pico_w-release -DZX_INPUT_JOYSTICK=1  # ST joystick (experimental; also needs the m68k rebuilt)
+ZX_INPUT_JOYSTICK=1 make build   # experimental ST joystick (rebuilds both targets)
 ```
 
-With `-DZX_GAMES_FROM_SD=0` the firmware runs an embedded snapshot and needs no card — handy for a first smoke test. For more on coding for the SidecarT, [the docs are here](https://docs.sidecartridge.com/sidecartridge-multidevice/programming/).
-
-## Credits
-
-MD/ZX stands on the shoulders of:
-
-- **[Andre Weissflog](https://github.com/floooh)** — the [`chips`](https://github.com/floooh/chips) ZX Spectrum emulator and Z80 core this is built on. As zx2040's author puts it, the project "is 90% because of his work."
-- **[Salvatore Sanfilippo](https://github.com/antirez)** — [zx2040](https://github.com/antirez/zx2040), the RP2040 port with the on-screen menu, per-game keymap system and 1-bit audio pipeline that MD/ZX adapts.
-- The **SidecarTridge Multi-device** framebuffer template it runs on.
-
-The Spectrum, and the joy of it, belongs to Sinclair Research and everyone who ever typed `LOAD ""`.
+For more on coding for the SidecarT, [the docs are here](https://docs.sidecartridge.com/sidecartridge-multidevice/programming/).
 
 ## License
 
