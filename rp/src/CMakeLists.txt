@@ -246,21 +246,15 @@ add_definitions(-D_DEBUG=${_DEBUG})
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)
 
-# ZX Spectrum port: compile-time input gates (see rp/src/zx/zx_config.h).
-# Display, audio and SD game loading are always on. The gates are read
-# from the environment so the root Makefile drives them, e.g.
-#   ZX_INPUT_JOYSTICK=1 make build
+# ZX Spectrum port (see rp/src/zx/zx_config.h). Display, audio, SD game
+# loading and the ST joystick are always on. Keyboard input stays a
+# knob, read from the environment so the root Makefile can drive it,
+# e.g.  ZX_INPUT_KEYBOARD=0 make build
 set(ZX_INPUT_KEYBOARD "$ENV{ZX_INPUT_KEYBOARD}")
 if(ZX_INPUT_KEYBOARD STREQUAL "")
     set(ZX_INPUT_KEYBOARD 1)
 endif()
-set(ZX_INPUT_JOYSTICK "$ENV{ZX_INPUT_JOYSTICK}")
-if(ZX_INPUT_JOYSTICK STREQUAL "")
-    set(ZX_INPUT_JOYSTICK 0)
-endif()
-add_definitions(
-    -DZX_INPUT_KEYBOARD=${ZX_INPUT_KEYBOARD}
-    -DZX_INPUT_JOYSTICK=${ZX_INPUT_JOYSTICK})
+add_definitions(-DZX_INPUT_KEYBOARD=${ZX_INPUT_KEYBOARD})
 
 # We don't modify the flash in Core 1
 add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)

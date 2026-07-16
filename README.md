@@ -25,6 +25,8 @@ Ported from Andre Weissflog's [`chips`](https://github.com/floooh/chips), via Sa
 |            | ← → (held together)      | Open the game / settings menu               |
 | Everywhere | ESC                      | Quit back to GEM                            |
 
+Joystick works as Kempston.
+
 ## Installation
 
 1. Download the latest `.uf2` and `.json` from the [releases page](https://github.com/neilrackett/md-zx/releases).
@@ -72,12 +74,6 @@ make debug
 # Open a UART console on the debug probe
 make uart
 ````
-
-Display, audio and SD game loading are always on. The one optional feature is the (experimental) ST joystick, enabled at build time:
-
-```bash
-ZX_INPUT_JOYSTICK=1 make build   # experimental ST joystick (rebuilds both targets)
-```
 
 For more on coding for the SidecarT, [the docs are here](https://docs.sidecartridge.com/sidecartridge-multidevice/programming/).
 

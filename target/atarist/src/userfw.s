@@ -31,13 +31,13 @@
 ; MFP source can fire. Only the custom VBL handler at $70 stays
 ; active.
 ;
-; IKBD bytes are forwarded inline from FBDRV_INLINE. The MOVEM-burst
-; framebuffer copy emits an IKBD poll block every FBDRV_IKBD_POLL_EVERY
-; iters (~20 HBLs / 1.24 ms): btst the ACIA RX-ready bit, and if set,
-; read the byte and emit it via a cart-bus read at IKBD_WINDOW_BASE +
-; byte ($FB8200..$FB82FF, md-devops single-byte ABI). The RP captures
-; the read via the commemul PIO+DMA ring (no per-read CPU overhead)
-; and runs the IKBD demux from its main loop.
+; IKBD bytes are forwarded interrupt-driven by userfw_acia_irq: on each
+; ACIA RX interrupt it reads the byte and emits it via a cart-bus read
+; at IKBD_WINDOW_BASE + byte ($FB8200..$FB82FF, md-devops single-byte
+; ABI). Reading on interrupt (rather than polling inside the blit) means
+; no byte is lost, so multi-byte joystick packets survive. The RP
+; captures the read via the commemul PIO+DMA ring (no per-read CPU
+; overhead) and runs the IKBD demux from its main loop.
 ;
 ; --- Constants ----------------------------------------------------
 
@@ -98,10 +98,6 @@ UFW_SCREEN_PAGE       equ $00077FEC          ; longword: current draw page addre
 ; 200*160/48=666r32. For values that don't divide evenly the trailing
 ; bytes are simply not copied (they remain stale on the screen page).
 FBDRV_ITER_BYTES      equ 48                            ; 12 longwords: D0-D7 + A1-A4 (A6=src, A5=dst, A0=dedicated audio pointer, A7=SP preserved -- IRQs may fire during the macro).
-FBDRV_IKBD_POLL_EVERY equ 40                            ; insert inline IKBD poll every Nth MOVEM iter. 40 iters * ~31us = ~1.24ms (~20 HBLs).
-    ifnd    ZX_JOYSTICK                                ; md-zx: normally passed via -DZX_JOYSTICK from the Makefile
-ZX_JOYSTICK           equ 0                            ;   1 = enable ST joystick event reporting ($14). Off by default (keyboard is the reliable path).
-    endc
 FBDRV_TOTAL_BYTES     equ (FB_COPY_LINES * FB_ROW_BYTES) ; honours FB_COPY_LINES
 FBDRV_MAIN_ITERS      equ (FBDRV_TOTAL_BYTES / FBDRV_ITER_BYTES)
 FBDRV_MAIN_BYTES      equ (FBDRV_MAIN_ITERS * FBDRV_ITER_BYTES)
@@ -151,25 +147,11 @@ FBDRV_TAIL_DISP       equ FBDRV_MAIN_BYTES                        ; tail goes at
 ; and the small d16(a5) tail MOVEM at the end.
 FBDRV_INLINE          macro
     movea.l #UFW_FB_SRC, a6
-FBDRV_POLL_CTR        set 0
+    ; IKBD is serviced interrupt-driven (userfw_acia_irq), so the blit
+    ; no longer polls the ACIA inline -- it's a straight MOVEM burst.
     rept    FBDRV_MAIN_ITERS
     movem.l (a6)+, d0-d7/a1-a4
     movem.l d0-d7/a1-a4, -(a5)
-FBDRV_POLL_CTR        set FBDRV_POLL_CTR + 1
-    ifeq    FBDRV_POLL_CTR - FBDRV_IKBD_POLL_EVERY
-FBDRV_POLL_CTR        set 0
-    ; Inline IKBD poll. Clobbers D0/A1 -- safe because the next
-    ; MOVEM iter reloads D0-D7/A1-A4 from cart, and the .after_copy
-    ; code after the macro overwrites D0 with UFW_SCREEN_PAGE before
-    ; using it. A0 is intentionally NOT touched here -- it holds the
-    ; dedicated audio buffer pointer for the Timer-B IRQ handler.
-    btst    #0, ACIA_KBD_STATUS.w
-    beq.s   *+18                          ; skip the 16-byte body if no data
-    moveq   #0, d0                        ; pre-zero D0 so move.b yields a clean 0..255 word
-    lea     IKBD_WINDOW_BASE, a1
-    move.b  ACIA_KBD_DATA.w, d0
-    tst.b   (a1, d0.w)                    ; emit byte via cart-bus read
-    endc
     endr
     ;
     ; Tail: copy the last FBDRV_TAIL_BYTES bytes of the blitted
@@ -261,10 +243,15 @@ FB_ROW_BYTES          equ 160                 ; 320 px * 4 bpp / 8
 
 ; --- IKBD ownership (Epic 3 Story 3.1) -----------------------------
 
-; Keyboard ACIA at $FFFFFC00/02. MIDI ACIA at $FFFFFC04/06 is not
-; touched. Status bit 0 = RX-data-ready; bit 1 = TX-empty.
+; Keyboard ACIA at $FFFFFC00/02. Status bit 0 = RX-data-ready; bit 1 =
+; TX-empty. The MIDI ACIA at $FFFFFC04/06 shares the one MFP ACIA
+; interrupt (IERB bit 6), so the interrupt-driven handler must drain it
+; too or the level-asserted IRQ line can re-trigger.
 ACIA_KBD_STATUS       equ $FFFFFC00
 ACIA_KBD_DATA         equ $FFFFFC02
+ACIA_MIDI_STATUS      equ $FFFFFC04
+ACIA_MIDI_DATA        equ $FFFFFC06
+MFP_ACIA_BIT          equ 6                  ; IERB/IMRB bit for keyboard/MIDI ACIA
 
 ; MC68901 MFP registers (subset we manipulate).
 MFP_IERA              equ $FFFFFA07          ; interrupt enable A (Timer-A = bit 5)
@@ -404,6 +391,13 @@ userfw:
     move.l  a0, VEC_TIMERB.w
     move.l  a0, VEC_TIMERA.w
 
+    ; md-zx: interrupt-driven IKBD -- install a real ACIA handler in
+    ; place of the dummy rte so keyboard + joystick bytes are read the
+    ; instant they arrive (the ACIA has a 1-byte buffer; polling loses
+    ; the multi-byte joystick packets). Enabled at the MFP below.
+    lea     userfw_acia_irq(pc), a0
+    move.l  a0, VEC_ACIA.w
+
     ; Stop both timers (kills any prior TOS event).
     clr.b   MFP_TBCR.w
     clr.b   MFP_TACR.w
@@ -474,20 +468,26 @@ userfw:
     bset    #0, MFP_IERA.w                ; Timer-B IRQ enable (IERA bit 0)
     bset    #0, MFP_IMRA.w                ; Timer-B IRQ unmask (IMRA bit 0)
 
+    bset    #MFP_ACIA_BIT, MFP_IERB.w     ; md-zx: enable keyboard/MIDI ACIA IRQ
+    bset    #MFP_ACIA_BIT, MFP_IMRB.w     ;         and unmask it
+
     ; Interrupts back on (caller's level, typically $2300).
     move.w  (sp)+, sr
 
-    ; --- md-zx Phase 5 (optional): enable IKBD joystick event reporting.
-    ; Sends $14 so the IKBD emits $FE/$FF joystick packets, which the RP
-    ; demux (ikbd.c, ZX_INPUT_JOYSTICK) maps to Kempston. Off by default
-    ; (ZX_JOYSTICK=0) so the reliable keyboard-only path is unchanged.
-    ; Keyboard scancodes continue alongside joystick events.
-    ifne    ZX_JOYSTICK
-.zxj_tx_wait:
+    ; --- md-zx: configure the IKBD for joystick play.
+    ; $12 disables mouse reporting so only keyboard + joystick share the
+    ; ACIA stream (mouse packets would otherwise desync the RP demux);
+    ; $14 puts the IKBD in joystick event-reporting mode, so it emits
+    ; $FE/$FF packets which the RP demux maps to Kempston. Keyboard
+    ; scancodes continue alongside joystick events.
+.zxj_tx_mouse:
     btst    #1, ACIA_KBD_STATUS.w        ; MC6850 TDRE = TX data register empty
-    beq.s   .zxj_tx_wait
+    beq.s   .zxj_tx_mouse
+    move.b  #$12, ACIA_KBD_DATA.w        ; IKBD: disable mouse reporting
+.zxj_tx_joy:
+    btst    #1, ACIA_KBD_STATUS.w
+    beq.s   .zxj_tx_joy
     move.b  #$14, ACIA_KBD_DATA.w        ; IKBD: set joystick event reporting
-    endc
 
     ; Initialise the hidden-page pointer. UFW_SCREEN_PAGE holds the
     ; page currently being drawn into; .after_copy toggles it between
@@ -701,6 +701,38 @@ userfw_timerb_audio:
     move.b  #YM_REG_CHB_VOL, YM_SELECT.w   ; latch ch B vol reg
     move.b  (a0)+, YM_DATA.w               ; vB -> ch B vol
     move.b  #YM_REG_CHA_VOL, YM_SELECT.w   ; back to ch A vol reg for next fire
+    rte
+
+; -------------------------------------------------------------------
+; userfw_acia_irq -- keyboard/MIDI ACIA IRQ handler.
+;
+; Reads each IKBD byte the instant it arrives -- interrupt-driven, so no
+; byte is lost -- and forwards it to the RP over the same cart-bus
+; window the inline poll used. This is what makes multi-byte joystick
+; packets survive (polling drops them). Keyboard scancodes ride the same
+; path, so keyboard input gets more robust too.
+;
+; The keyboard and MIDI ACIAs share this one MFP interrupt (IERB bit 6),
+; so the MIDI ACIA is drained as well -- otherwise its level-asserted
+; IRQ line could re-trigger us forever. MFP is auto-EOI (VR S=0), so no
+; in-service ack. Only D0/A1 are touched, and both are saved, so the
+; handler is safe to fire mid-blit (which holds D0-D7/A1-A4 live).
+userfw_acia_irq:
+    move.l  d0, -(sp)
+    move.l  a1, -(sp)
+    lea     IKBD_WINDOW_BASE, a1
+    btst    #0, ACIA_KBD_STATUS.w         ; keyboard RX-data-ready?
+    beq.s   .acia_midi
+    moveq   #0, d0                        ; clean 0..255 word
+    move.b  ACIA_KBD_DATA.w, d0           ; read byte (clears kbd RX-full)
+    tst.b   (a1, d0.w)                    ; forward via cart-bus read
+.acia_midi:
+    btst    #0, ACIA_MIDI_STATUS.w        ; drain MIDI too (shared IRQ line)
+    beq.s   .acia_done
+    move.b  ACIA_MIDI_DATA.w, d0          ; read + discard
+.acia_done:
+    movea.l (sp)+, a1
+    move.l  (sp)+, d0
     rte
 
 ; -------------------------------------------------------------------

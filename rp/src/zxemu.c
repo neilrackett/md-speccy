@@ -1126,10 +1126,9 @@ void zxemu_handle_key(const ikbd_key_event_t *k) {
 }
 
 void zxemu_render_frame(void) {
-    // Compose this frame's button state: keyboard, plus the ST joystick
-    // when that phase is built. get_device_button() reads zx_input_mask.
+    // Compose this frame's button state: keyboard | ST joystick.
+    // get_device_button() reads zx_input_mask.
     zx_input_mask = zx_kbd_mask;
-#if ZX_INPUT_JOYSTICK
     {
         uint8_t j = ikbd_get_joystick();  // bit0 up,1 down,2 left,3 right,7 fire
         if (j & 0x01) zx_input_mask |= (1u << ZX_BTN_UP);
@@ -1138,7 +1137,6 @@ void zxemu_render_frame(void) {
         if (j & 0x08) zx_input_mask |= (1u << ZX_BTN_RIGHT);
         if (j & 0x80) zx_input_mask |= (1u << ZX_BTN_FIRE);
     }
-#endif
 
     // Menu input (game selection / settings). ui_handle_key_press()
     // itself loads the selected game on FIRE and clears menu_active.

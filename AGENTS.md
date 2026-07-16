@@ -74,26 +74,21 @@ firmware** (`rp/build.sh` via CMake presets) → `dist/<UUID>-<VER>.uf2` +
 
 ### Compile-time gates
 
-Display, audio and SD game loading are always on (proven; no build
-without them). Only the input paths are gated. Defaults live in
-`rp/src/zx/zx_config.h` (`#ifndef` fallbacks) and are set as CMake cache
-options in `rp/src/CMakeLists.txt`:
+Display, audio, SD game loading and the ST joystick are all always on
+(proven; no build without them). The one remaining knob gates keyboard
+input; its default lives in `rp/src/zx/zx_config.h` (`#ifndef` fallback)
+and it's read from the environment in `rp/src/CMakeLists.txt`:
 
 | Gate | Default | Effect when off |
 | --- | --- | --- |
-| `ZX_INPUT_KEYBOARD` | 1 | no keyboard input |
-| `ZX_INPUT_JOYSTICK` | 0 | no ST joystick (keyboard only) |
+| `ZX_INPUT_KEYBOARD` | 1 | no keyboard input (joystick only) |
 
-Override from the root Makefile, e.g. `ZX_INPUT_JOYSTICK=1 make build`.
-This drives **both** targets: the RP `CMakeLists.txt` reads the gate from
-the environment (`$ENV{ZX_INPUT_JOYSTICK}`), and
-`target/atarist/build.sh` forwards `ZX_JOYSTICK=1` to the m68k `make`
-(→ `-DZX_JOYSTICK=1` to vasm → `userfw.s`). No cmake / manual `equ` edit
-needed.
+Override from the root Makefile, e.g. `ZX_INPUT_KEYBOARD=0 make build`.
 
-(The earlier `ZX_AUDIO_YM` and `ZX_GAMES_FROM_SD` gates were removed once
-those paths were confirmed working; `builtin_game.h` is still used — the
-embedded demo is seeded into an empty `/zx` folder — and
+(The earlier `ZX_AUDIO_YM`, `ZX_GAMES_FROM_SD` and `ZX_INPUT_JOYSTICK`
+gates were removed once those paths were confirmed working on hardware;
+`builtin_game.h` is still used — the embedded demo is seeded into an
+empty `/zx` folder — and
 `builtin_keymaps.h` is the firmware-default `keymaps.txt`.)
 
 ### Build gotchas
@@ -161,20 +156,24 @@ VBL** — one call per loop paces the app to 50 Hz.
 
 ### IKBD pipeline (keyboard + ESC exit + joystick)
 
-`userfw.s` owns the ST IKBD ACIA end-to-end so the VBL blit runs
-interrupt-free:
+`userfw.s` owns the ST IKBD ACIA end-to-end:
 
-1. m68k stubs 5 IRQ vectors (HBL/Timer-A/C/D/ACIA) to a 1-instruction
-   `rte`; Timer-B is owned by audio.
-2. IKBD draining is **inlined in `FBDRV_INLINE`** — every
-   `FBDRV_IKBD_POLL_EVERY` (40) iters it reads the ACIA and forwards the
-   byte via a cart read at `IKBD_WINDOW_BASE + byte` (`$FB8200..$FB82FF`).
+1. m68k stubs HBL/Timer-A/C/D to a 1-instruction `rte`; Timer-B is owned
+   by audio. **The ACIA IRQ ($118) gets a real handler** (`userfw_acia_irq`)
+   and the ACIA MFP interrupt (IERB bit 6) is enabled.
+2. IKBD ingest is **interrupt-driven**: on each ACIA RX IRQ the handler
+   reads the byte and forwards it via a cart read at `IKBD_WINDOW_BASE +
+   byte` (`$FB8200..$FB82FF`). Reading on interrupt (rather than the old
+   inline poll) means no byte is lost, so the multi-byte joystick packets
+   survive. It drains the MIDI ACIA too (shared MFP IRQ), saves only
+   D0/A1, and relies on MFP auto-EOI (no in-service ack). At boot it
+   sends `$12` (mouse off) + `$14` (joystick event reporting on).
 3. **RP captures** via the commemul ROM3 DMA ring; the main loop drains
    it (`commemul_poll`), filters the `$FB82xx` window, pushes bytes to a
    raw ring.
 4. **RP demux** (`ikbd.c` `ikbd_pump`) classifies bytes: `$00..$7F` press,
-   `$80..$F1` release. `$FD/$FE/$FF` joystick packets are parsed when the
-   port enables joystick (see port section), else discarded.
+   `$80..$F1` release; `$FE/$FF` (one stick) / `$FD` (both) joystick
+   packets are framed into `s_joy_state` (a small pending-byte counter).
 5. **ESC exit** — ESC press+release within 200 ms writes
    `CART_CMD_BOOT_GEM` to the sentinel; the m68k VBL loop polls it and
    exits to GEM.
@@ -297,20 +296,18 @@ each frame, so `get_device_button()` — and thus zx2040's entire per-game
 keymap/macro parser — works unchanged. Kempston key codes are
 `$FB..$FF`.
 
-### Joystick (off by default, UNTESTED)
+### Joystick (always on, hardware-confirmed)
 
-Fully gated. When `ZX_INPUT_JOYSTICK`: `ikbd.c` runs a small state
-machine consuming `$FE/$FF` (one stick) / `$FD` (both) packets into
-`s_joy_state` (bit0 up,1 down,2 left,3 right,7 fire), exposed via
-`ikbd_get_joystick()`; `zxemu_render_frame` ORs those into
-`zx_input_mask`. m68k side: `userfw.s` sends `$14` (enable joystick event
-reporting) inside an `ifne ZX_JOYSTICK` block after IRQs come back on;
-`ZX_JOYSTICK` defaults to 0 via `ifnd` but is normally supplied as
-`-DZX_JOYSTICK=$(ZX_JOYSTICK)` from the m68k Makefile. Build both sides
-with `ZX_INPUT_JOYSTICK=1 make build` (see the gates section).
-**Both sides compile/assemble but this path is documented-fragile
-(byte-loss / demux desync) and has not run on hardware.** Keyboard is the
-reliable route; leave joystick off unless deliberately testing it.
+`ikbd.c` runs a small state machine consuming `$FE/$FF` (one stick) /
+`$FD` (both) packets into `s_joy_state` (bit0 up,1 down,2 left,3 right,7
+fire), exposed via `ikbd_get_joystick()`; `zxemu_render_frame` ORs those
+into `zx_input_mask` each frame. The m68k side is the interrupt-driven
+ACIA handler in the IKBD pipeline above (`userfw_acia_irq` + `$12`/`$14`
+sends). This is what made it reliable: the earlier version *polled* the
+ACIA inside the blit and lost bytes, shredding the multi-byte packets —
+the interrupt handler reads every byte the instant it arrives, so the
+framing holds. Works on hardware (keyboard + joystick together). If the
+byte loss ever regresses, the symptom is stuck/phantom directions.
 
 ### Audio
 
