@@ -84,6 +84,17 @@ set(CMAKE_C_STANDARD 11)
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
 
+# FatFs (exFAT + heap LFN) is written for malloc-returns-NULL semantics:
+# f_mkdir's dir_clear() requests up to 32 KB then halves on each NULL
+# until it fits. pico-sdk's default PICO_MALLOC_PANIC=1 turns that first
+# over-ceiling request into a hard "Out of memory" panic before the
+# fallback runs. The ZX emulator fills most of RAM (~16 KB heap left), so
+# disable the panic (heap is still capped at __StackLimit by _sbrk, so
+# the cart region stays protected) and let FatFs degrade gracefully.
+# Declared before the subdirectories so every target (incl. settings /
+# FatFs) is built consistently.
+add_definitions(-DPICO_MALLOC_PANIC=0)
+
 add_subdirectory(settings)
 
 # Tell CMake where to find other source code
