@@ -25,7 +25,13 @@ target_firmware="target_firmware.h"
 # (CI, sub-shells, build wrappers). Without it stcmd's `-it` flag aborts
 # with "the input device is not a TTY" and the build silently keeps
 # whatever BOOT.BIN was previously generated.
-STCMD_NO_TTY=1 ST_WORKING_FOLDER=$working_folder stcmd make $build_type
+# ST joystick (experimental, md-zx): a root `ZX_INPUT_JOYSTICK=1 make`
+# forwards here as ZX_INPUT_JOYSTICK in the environment; pass it to the
+# m68k make as an argument (ZX_JOYSTICK=1) so userfw.s enables IKBD
+# joystick event reporting. Default off -> no argument -> unchanged build.
+JOY_ARG=""
+if [ "${ZX_INPUT_JOYSTICK:-0}" = "1" ]; then JOY_ARG="ZX_JOYSTICK=1"; fi
+STCMD_NO_TTY=1 ST_WORKING_FOLDER=$working_folder stcmd make $build_type $JOY_ARG
 make_status=$?
 if [ "$make_status" -ne 0 ]; then
     echo "ERROR: m68k make failed (status $make_status)"

@@ -38,7 +38,11 @@ BIN = BOOT.BIN
 # _DEBUG: 1 to enable debug, 0 to disable them
 # To disable debug, make target DEBUG_MODE=0
 DEBUG_MODE = 1
-VASMFLAGS=-Faout -quiet -x -m68000 -spaces -showopt -devpac -D_DEBUG=$(DEBUG_MODE) -DGEMDOS_DATE=$(GEMDOS_DATE_FORMATTED) -DGEMDOS_TIME=$(GEMDOS_TIME_FORMATTED) -DVERSION_MAJOR=\"$(VERSION_MAJOR)\" -DVERSION_MINOR=\"$(VERSION_MINOR)\" -DVERSION_PATCH=\"$(VERSION_PATCH)\"
+# ST joystick (experimental, md-zx): pass ZX_JOYSTICK=1 to enable IKBD
+# joystick event reporting in userfw.s. Default 0. Driven from the root
+# build (ZX_INPUT_JOYSTICK=1 make) via target/atarist/build.sh.
+ZX_JOYSTICK ?= 0
+VASMFLAGS=-Faout -quiet -x -m68000 -spaces -showopt -devpac -D_DEBUG=$(DEBUG_MODE) -DZX_JOYSTICK=$(ZX_JOYSTICK) -DGEMDOS_DATE=$(GEMDOS_DATE_FORMATTED) -DGEMDOS_TIME=$(GEMDOS_TIME_FORMATTED) -DVERSION_MAJOR=\"$(VERSION_MAJOR)\" -DVERSION_MINOR=\"$(VERSION_MINOR)\" -DVERSION_PATCH=\"$(VERSION_PATCH)\"
 VASM = vasm
 VLINK =  vlink
 LINKER_SCRIPT = $(SOURCES_DIR)/userfw.ld

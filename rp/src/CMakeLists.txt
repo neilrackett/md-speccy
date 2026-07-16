@@ -246,17 +246,20 @@ add_definitions(-D_DEBUG=${_DEBUG})
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)
 
-# ZX Spectrum port: compile-time phase gates (see rp/src/zx/zx_config.h).
-# Toggle any phase from the build to test functionality in isolation on
-# hardware, e.g.  cmake --preset pico_w-release -DZX_GAMES_FROM_SD=0
-set(ZX_INPUT_KEYBOARD 1 CACHE STRING "ST keyboard input -> Kempston/keys (Phase 2)")
-set(ZX_AUDIO_YM       1 CACHE STRING "Spectrum beeper -> YM2149 audio (Phase 3)")
-set(ZX_GAMES_FROM_SD  1 CACHE STRING "Load games + keymaps.txt from SD (Phase 4)")
-set(ZX_INPUT_JOYSTICK 0 CACHE STRING "ST joystick -> Kempston (Phase 5; needs m68k rebuild)")
+# ZX Spectrum port: compile-time input gates (see rp/src/zx/zx_config.h).
+# Display, audio and SD game loading are always on. The gates are read
+# from the environment so the root Makefile drives them, e.g.
+#   ZX_INPUT_JOYSTICK=1 make build
+set(ZX_INPUT_KEYBOARD "$ENV{ZX_INPUT_KEYBOARD}")
+if(ZX_INPUT_KEYBOARD STREQUAL "")
+    set(ZX_INPUT_KEYBOARD 1)
+endif()
+set(ZX_INPUT_JOYSTICK "$ENV{ZX_INPUT_JOYSTICK}")
+if(ZX_INPUT_JOYSTICK STREQUAL "")
+    set(ZX_INPUT_JOYSTICK 0)
+endif()
 add_definitions(
     -DZX_INPUT_KEYBOARD=${ZX_INPUT_KEYBOARD}
-    -DZX_AUDIO_YM=${ZX_AUDIO_YM}
-    -DZX_GAMES_FROM_SD=${ZX_GAMES_FROM_SD}
     -DZX_INPUT_JOYSTICK=${ZX_INPUT_JOYSTICK})
 
 # We don't modify the flash in Core 1

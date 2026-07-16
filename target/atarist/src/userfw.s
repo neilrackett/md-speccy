@@ -99,7 +99,9 @@ UFW_SCREEN_PAGE       equ $00077FEC          ; longword: current draw page addre
 ; bytes are simply not copied (they remain stale on the screen page).
 FBDRV_ITER_BYTES      equ 48                            ; 12 longwords: D0-D7 + A1-A4 (A6=src, A5=dst, A0=dedicated audio pointer, A7=SP preserved -- IRQs may fire during the macro).
 FBDRV_IKBD_POLL_EVERY equ 40                            ; insert inline IKBD poll every Nth MOVEM iter. 40 iters * ~31us = ~1.24ms (~20 HBLs).
-ZX_JOYSTICK           equ 0                            ; md-zx Phase 5: 1 = enable ST joystick event reporting ($14). Off by default (keyboard is the reliable path).
+    ifnd    ZX_JOYSTICK                                ; md-zx: normally passed via -DZX_JOYSTICK from the Makefile
+ZX_JOYSTICK           equ 0                            ;   1 = enable ST joystick event reporting ($14). Off by default (keyboard is the reliable path).
+    endc
 FBDRV_TOTAL_BYTES     equ (FB_COPY_LINES * FB_ROW_BYTES) ; honours FB_COPY_LINES
 FBDRV_MAIN_ITERS      equ (FBDRV_TOTAL_BYTES / FBDRV_ITER_BYTES)
 FBDRV_MAIN_BYTES      equ (FBDRV_MAIN_ITERS * FBDRV_ITER_BYTES)

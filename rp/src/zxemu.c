@@ -39,14 +39,12 @@ void vram_force_dirty(void);
 #include "zx.h"
 #include "zx-roms.h"
 
-#if ZX_GAMES_FROM_SD
 #include "ff.h"
 #include "sdcard.h"
 #include "aconfig.h"
 #include "settings/settings.h"
-#endif
-#include "builtin_game.h"
-#include "builtin_keymaps.h"
+#include "builtin_game.h"     // embedded demo seeded into an empty /zx
+#include "builtin_keymaps.h"  // firmware-default keymaps.txt
 
 // The Spectrum bitmap (256x192) is shown 1:1, centred in the 320x200
 // framebuffer; the surrounding margin is the Spectrum border.
@@ -94,6 +92,7 @@ void load_game(int game_id);
 #define ZX_MAX_GAMES     128    // Max .z80 snapshots listed from SD.
 #define ZX_KEYMAP_BUF_SZ 4096   // RAM buffer for the SD keymaps.txt.
 #define ZX_YM_VOLUME     12     // YM 4-bit volume for beeper "high".
+#define ZX_DEMO_FILENAME "3dshow_demo.z80"  // seeded into an empty /zx folder
 
 struct game_entry {
     char name[28];          // Z80 snapshot filename (SD) or label.
@@ -225,22 +224,16 @@ struct UISettingsItem {
                                // values array. If values is defined, this
                                // must be defined as well.
 } SettingsList[] = {
-    {UI_EVENT_CLOCK,
-        "clock", &EMU.emu_clock, 5000, 130000, 600000, NULL, NULL},
-    {UI_EVENT_BORDER,
-        "border", &EMU.show_border, 1, 0, 1, NULL, NULL},
-    {UI_EVENT_SCALING,
-        "scaling", &EMU.scaling, 0, 0, 0,
-        SettingsZoomValues, SettingsZoomValuesNames,
-    },
+    // Only settings that actually do something on this target. The
+    // upstream clock / scaling / brightness / partial-update / audio-sync
+    // controls were dropped: the RP runs at a fixed 225 MHz (no runtime
+    // overclock -- the cart-bus PIO timing is tuned to it), the Spectrum
+    // is always shown 1:1, and there is no display backlight or ST77xx
+    // partial update here.
     {UI_EVENT_VOLUME,
         "volume", &EMU.volume, 1, 0, 20, NULL, NULL},
-    {UI_EVENT_BRIGHTNESS,
-        "bright", &EMU.brightness, 1, 0, ST77_MAX_BRIGHTNESS, NULL, NULL},
-    {UI_EVENT_PARTIAL,
-        "part-up", &EMU.partial_update, 1, 0, 1, NULL, NULL},
-    {UI_EVENT_SYNC,
-        "sync",(uint32_t*)&EMU.audio_sample_wait, 5, 0, 1000, NULL, NULL},
+    {UI_EVENT_BORDER,
+        "border", &EMU.show_border, 1, 0, 1, NULL, NULL},
     {UI_EVENT_NONE,
         "scan-p", (uint32_t*)&EMU.zx.scanline_period, 1, 10, 500, NULL, NULL}
 };
@@ -435,16 +428,13 @@ uint32_t ui_handle_key_press(void) {
                                           value_change_dir);
         break;
     case KEMPSTONE_FIRE:
-        if (EMU.selected_game == EMU.loaded_game) {
-            // We are forced to reload the game, because the UI
-            // messed with the Spectrum video RAM.
+        if (EMU.selected_game >= 0) {
+            // Load (or reload -- the menu overwrote the Spectrum VRAM) the
+            // selected game and start playing: one press, menu dismissed.
             load_game(EMU.selected_game);
             EMU.menu_active = 0;
             EMU.menu_left_at_tick = EMU.tick;
             event = UI_EVENT_DISMISS;
-        } else if (EMU.selected_game >= 0) {
-            load_game(EMU.selected_game);
-            event = UI_EVENT_LOADGAME;
         }
         break;
     }
@@ -494,7 +484,7 @@ void ui_draw_menu(void) {
         if (j >= (int)GamesTableSize || y > menu_y+menu_h) break;
 
         int color = j >= 0 ? 4 : 6;
-        font_size = j >= 0 ? 2 : 1;
+        font_size = 1;   // games same size as settings; fits more on screen
 
         // Highlight the currently selected game, with a box of the color
         // of the font, and the black font (so basically the font is inverted).
@@ -713,7 +703,6 @@ static int ends_with_z80(const char *name) {
            e[2] == '8' && e[3] == '0';
 }
 
-#if ZX_GAMES_FROM_SD
 // SD app folder (from per-app config, default "/zx").
 static char zx_folder[64] = "/zx";
 // RAM copy of keymaps.txt; EMU.keymap_file points here.
@@ -767,6 +756,8 @@ int populate_games_list(void) {
     while (GamesTableSize < ZX_MAX_GAMES &&
            f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
         if (fno.fattrib & AM_DIR) continue;
+        if (fno.fname[0] == '.') continue;   // skip dot / AppleDouble (._*.z80)
+        if (fno.fattrib & (AM_HID | AM_SYS)) continue;
         if (!ends_with_z80(fno.fname)) continue;
         struct game_entry *ge = &GamesTable[GamesTableSize++];
         strncpy(ge->name, fno.fname, sizeof(ge->name) - 1);
@@ -775,21 +766,32 @@ int populate_games_list(void) {
         ge->size = (uint32_t)fno.fsize;
     }
     f_closedir(&dir);
+
+    // Make sure the embedded demo is always present in the folder,
+    // regardless of what else is there. FA_CREATE_NEW fails harmlessly if
+    // it already exists (FAT names are case-insensitive), in which case
+    // the scan above already listed it; otherwise we write it and add it.
+    // It's a normal file the user can delete -- it just reappears next
+    // boot.
+    if (GamesTableSize < ZX_MAX_GAMES) {
+        char path[96];
+        snprintf(path, sizeof(path), "%s/%s", zx_folder, ZX_DEMO_FILENAME);
+        FIL f;
+        if (f_open(&f, path, FA_CREATE_NEW | FA_WRITE) == FR_OK) {
+            UINT bw = 0;
+            f_write(&f, zx_builtin_game, zx_builtin_game_len, &bw);
+            f_close(&f);
+            if (bw == zx_builtin_game_len) {
+                struct game_entry *ge = &GamesTable[GamesTableSize++];
+                strncpy(ge->name, ZX_DEMO_FILENAME, sizeof(ge->name) - 1);
+                ge->name[sizeof(ge->name) - 1] = 0;
+                ge->addr = NULL;
+                ge->size = zx_builtin_game_len;
+            }
+        }
+    }
     return (int)GamesTableSize;
 }
-#else
-// No-SD build: a single baked-in game + firmware-default keymaps.
-int populate_games_list(void) {
-    struct game_entry *ge = &GamesTable[0];
-    strncpy(ge->name, "BUILTIN", sizeof(ge->name) - 1);
-    ge->name[sizeof(ge->name) - 1] = 0;
-    ge->addr = (void *)zx_builtin_game;
-    ge->size = zx_builtin_game_len;
-    GamesTableSize = 1;
-    EMU.keymap_file = (char *)zx_builtin_keymaps;
-    return 1;
-}
-#endif
 
 // Bring up the emulator: defaults, ST palette, and the Z80 core.
 // Replaces upstream init_emulator() minus all the Pico display / GPIO /
@@ -1056,7 +1058,6 @@ void load_game(int game_id) {
     if (EMU.loaded_game != game_id)
         EMU.zx.scanline_period = ZX_DEFAULT_SCANLINE_PERIOD;
 
-#if ZX_GAMES_FROM_SD
     // Borrow the chunked framebuffer as a transient load buffer -- it is
     // overwritten by the next update_display() anyway, so this avoids a
     // permanent ~50 KB allocation for the .z80 image.
@@ -1071,10 +1072,6 @@ void load_game(int game_id) {
     f_close(&f);
     chips_range_t r = { .ptr = fb_chunked_buffer, .size = br };
     zx_quickload(&EMU.zx, r);
-#else
-    chips_range_t r = { .ptr = g->addr, .size = g->size };
-    zx_quickload(&EMU.zx, r);
-#endif
 
     get_keymap_for_current_game(game_id);
     EMU.loaded_game = game_id;
@@ -1085,12 +1082,11 @@ void load_game(int game_id) {
 void zxemu_init(void) {
     init_emulator();
 
-    // Populate the games list (SD scan or the baked-in game) and boot
-    // the first entry. If none is found we still fall through: the ZX
-    // ROM boot screen renders, so the user can see the emulator is
-    // alive (and, on an SD build, that the folder is empty).
-    if (populate_games_list() > 0)
-        load_game(EMU.selected_game);
+    // Populate the games list (SD scan + embedded demo, or the baked-in
+    // game). No game is auto-loaded: init_emulator() leaves the menu
+    // active, so the user always starts in the picker and chooses what to
+    // run. Until they do, the ZX ROM boot screen renders behind the menu.
+    populate_games_list();
 }
 
 // Atari ST IKBD scancodes for the keys we map to gameplay buttons.
@@ -1100,9 +1096,16 @@ void zxemu_init(void) {
 #define ZX_SC_RIGHT  0x4D
 #define ZX_SC_SPACE  0x39
 #define ZX_SC_ENTER  0x1C
+#define ZX_SC_HELP   0x62
 
 void zxemu_handle_key(const ikbd_key_event_t *k) {
 #if ZX_INPUT_KEYBOARD
+    // Help key: quick access to the game / settings menu (same as the
+    // Left+Right long-press, but instant).
+    if (k->scancode == ZX_SC_HELP) {
+        if (k->is_press) EMU.menu_active = 1;
+        return;
+    }
     int btn = -1;
     switch (k->scancode) {
         case ZX_SC_LEFT:  btn = ZX_BTN_LEFT;  break;
@@ -1169,7 +1172,6 @@ void zxemu_render_frame(void) {
 }
 
 void zxemu_audio_fill(uint8_t *buf, uint32_t bytes) {
-#if ZX_AUDIO_YM
     // The emulator samples the 1-bit beeper into zx.audiobuf during
     // zx_exec(). Decimate the bits produced since the last fill down to
     // the ~112 samples the m68k Timer-B handler consumes per VBL, and
@@ -1180,25 +1182,33 @@ void zxemu_audio_fill(uint8_t *buf, uint32_t bytes) {
     uint32_t w = EMU.zx.audiobuf_byte * 32 + EMU.zx.audiobuf_bit;
     uint32_t avail = (w - rd) & (total - 1);
 
+    // Peak YM volume follows the menu volume setting (0..20 -> 0..15).
+    const uint8_t vmax = (uint8_t)((EMU.volume * 15u) / 20u);
+
     if (avail < nsamp) {
         // Too few fresh samples: hold the current beeper level (DC).
-        uint8_t v = EMU.zx.beeper_state ? ZX_YM_VOLUME : 0;
+        uint8_t v = EMU.zx.beeper_state ? vmax : 0;
         for (uint32_t i = 0; i < nsamp; i++) { buf[2*i] = v; buf[2*i+1] = v; }
         return;
     }
 
-    uint32_t step = avail / nsamp;
+    // Box-filter decimation: average the `step` beeper bits that fall in
+    // each output sample's window (i.e. the local duty cycle) and map that
+    // to a graduated YM volume. This low-passes the 1-bit signal instead
+    // of point-sampling one bit, which removes most of the aliasing that
+    // made the raw beeper sound harsh.
+    const uint32_t step = avail / nsamp;
     uint32_t idx = rd;
     for (uint32_t i = 0; i < nsamp; i++) {
-        uint32_t bit = (EMU.zx.audiobuf[(idx >> 5) & (AUDIOBUF_LEN - 1)]
-                        >> (idx & 31)) & 1u;
-        uint8_t v = bit ? ZX_YM_VOLUME : 0;
+        uint32_t ones = 0;
+        for (uint32_t s = 0; s < step; s++) {
+            ones += (EMU.zx.audiobuf[(idx >> 5) & (AUDIOBUF_LEN - 1)]
+                     >> (idx & 31)) & 1u;
+            idx++;
+        }
+        uint8_t v = (uint8_t)((ones * vmax) / step);   // duty cycle -> volume
         buf[2*i] = v;
         buf[2*i+1] = v;
-        idx += step;
     }
     rd = w;
-#else
-    for (uint32_t i = 0; i < bytes; i++) buf[i] = 0;
-#endif
 }

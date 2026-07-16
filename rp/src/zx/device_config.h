@@ -61,13 +61,9 @@ extern uint32_t zx_input_mask;
 
 /* The upstream emulator samples the 1-bit beeper into zx_t.audiobuf
  * only when SPEAKER_PIN != -1; the YM fill callback in zxemu.c
- * consumes that buffer. There is no real PWM pin -- this is just the
- * on/off switch for beeper sampling. */
-#if ZX_AUDIO_YM
+ * consumes that buffer. There is no real PWM pin -- this just keeps the
+ * upstream beeper-sampling path enabled. */
 #define SPEAKER_PIN 1
-#else
-#define SPEAKER_PIN (-1)
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Display metrics (VRAM coordinate space)                            */

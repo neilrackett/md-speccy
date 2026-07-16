@@ -69,6 +69,12 @@ fi
 if [ -d "$REPO_ROOT/target" ]; then
     printf "%s\n" "$FINAL_VERSION" > "$REPO_ROOT/target/version.txt"
 fi
+# The m68k Makefile reads version.txt from its own dir (cwd = target/atarist
+# under stcmd), so keep that copy in sync too or the ST binary reports a
+# stale version.
+if [ -d "$REPO_ROOT/target/atarist" ]; then
+    printf "%s\n" "$FINAL_VERSION" > "$REPO_ROOT/target/atarist/version.txt"
+fi
 
 if [ -n "$HEADER_PATH" ]; then
     mkdir -p "$(dirname "$HEADER_PATH")"
