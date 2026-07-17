@@ -1,4 +1,4 @@
-# AGENTS.md — MD/ZX playbook
+# AGENTS.md — MD/Speccy playbook
 
 This is the single source of agent guidance for this repo. `CLAUDE.md`
 is just `@AGENTS.md`; keep everything here.
@@ -31,7 +31,7 @@ author. (Also: no `Co-Authored-By` trailers at all, per the repo owner.)
 
 ## What this repo is
 
-**MD/ZX** — a **ZX Spectrum 48K emulator** for the Atari ST / STE /
+**MD/Speccy** — a **ZX Spectrum 48K emulator** for the Atari ST / STE /
 MegaST(E), built on the SidecarTridge Multi-device **framebuffer
 template**. It is a port of [zx2040](https://github.com/antirez/zx2040)
 (Salvatore Sanfilippo's RP2040 port of Andre Weissflog's `chips`
@@ -43,7 +43,7 @@ The repo has two layers:
 1. **The framebuffer template** (the foundation) — draw a 320×200
    16-colour framebuffer on the RP2040, the firmware blits it to the ST
    each VBL at 50 Hz, with ST keyboard and YM2149 audio for free.
-2. **The MD/ZX port** (what sits on top) — the emulator, its VRAM→FB
+2. **The MD/Speccy port** (what sits on top) — the emulator, its VRAM→FB
    decode, ST-keyboard→Kempston input, beeper→YM audio, and SD game
    loading. Lives in `rp/src/zxemu.c` + `rp/src/zx/`.
 
@@ -88,7 +88,7 @@ Override from the root Makefile, e.g. `ZX_INPUT_KEYBOARD=0 make build`.
 (The earlier `ZX_AUDIO_YM`, `ZX_GAMES_FROM_SD` and `ZX_INPUT_JOYSTICK`
 gates were removed once those paths were confirmed working on hardware.
 `builtin_game.h` is still used — the embedded demo is seeded into an
-empty `/zx` folder. The old `builtin_keymaps.h` / `keymaps.txt` system
+empty `/speccy` folder. The old `builtin_keymaps.h` / `keymaps.txt` system
 was dropped when input moved to a direct ST→Spectrum keyboard mapping.)
 
 ### Build gotchas
@@ -176,7 +176,7 @@ VBL** — one call per loop paces the app to 50 Hz.
    packets are framed into `s_joy_state` (a small pending-byte counter).
 5. **Exit to GEM** — `ikbd_request_boot_gem()` writes `CART_CMD_BOOT_GEM`
    to the sentinel; the m68k VBL loop polls it and exits to GEM. (The
-   built-in ESC press+release auto-exit still exists but MD/ZX disables
+   built-in ESC press+release auto-exit still exists but MD/Speccy disables
    it — see the input section; the menu's Exit item drives this instead.)
    **The sentinel is a one-shot:** the m68k can't write the RP-owned cart
    region and the RP only zeroes it at boot, so a `BOOT_GEM` left set
@@ -185,14 +185,14 @@ VBL** — one call per loop paces the app to 50 Hz.
    `ikbd_clear_command()` (re-arm to `CART_CMD_NOP`) every iteration;
    `BOOT_GEM` survives the one frame between the exit write and userfw's
    VBL read (`fb_publish` blocks until that read), then the next
-   iteration wipes it, so a later reset auto-boots MD/ZX cleanly.
+   iteration wipes it, so a later reset auto-boots MD/Speccy cleanly.
 
 ### Audio pipeline (YM2149)
 
 RP fills a 1 KB cart buffer at `$FA4100` with (vA, vB) volume pairs;
 m68k Timer-B (`/4`, TBDR=110 → ~5,585 Hz, ~112 fires/PAL VBL) writes both
 YM volume regs per fire. `userfw_vbl` resets the A0 read cursor to the
-buffer base every VBL (the resync edge). MD/ZX installs its own fill
+buffer base every VBL (the resync edge). MD/Speccy installs its own fill
 callback (`audio_set_fill_callback`) — see port section.
 
 ### Shared 64 KB cartridge region
@@ -208,7 +208,7 @@ hard-code. Key offsets: cartridge image (16 KB), `CMD_MAGIC_SENTINEL`
 
 - `main.c` — clock/voltage + config init, then `emul_start()`. Don't add
   features here.
-- `emul.c` — **boot path + main loop, rewritten for MD/ZX.** Brings up
+- `emul.c` — **boot path + main loop, rewritten for MD/Speccy.** Brings up
   romemul / commemul / fb / palette / audio / SD, calls `zxemu_init()`,
   installs `zxemu_audio_fill`, then loops: `fb_pump_rom3()`,
   `ikbd_pump()`, drain keys → `zxemu_handle_key()`,
@@ -217,16 +217,16 @@ hard-code. Key offsets: cartridge image (16 KB), `CMD_MAGIC_SENTINEL`
 - `fb.c` / `fb_chunked.c` / `fb_blit.c` / `fb_font.c` — framebuffer +
   draw primitives + the dual-core c2p worker. `fb_publish()` is the
   VBL-synced hand-off. (`fb_render_frame` and the internal demo sprite
-  are legacy and now only paint the boot frame; MD/ZX overwrites it.)
+  are legacy and now only paint the boot frame; MD/Speccy overwrites it.)
 - `commemul.c` — ROM3 cart-bus capture ring. **The ring was shrunk from
-  32 KB to 4 KB** for MD/ZX (`COMM_RING_BITS` 15→12) — it only carries
+  32 KB to 4 KB** for MD/Speccy (`COMM_RING_BITS` 15→12) — it only carries
   IKBD bytes (<1/ms, drained sub-ms), and the RAM was needed for the
   emulator.
 - `ikbd.c` / `ikbd.h` — IKBD ingest + demux; `ikbd_pop_key`. Gained a
   gated joystick packet parser + `ikbd_get_joystick()` for the port.
 - `romemul.*`, `sdcard.c`, `hw_config.c`, `gconfig.c`, `aconfig.c`,
   `select.c`, `reset.c`, `palette.c`, `audio.c` — unchanged template
-  services. `aconfig.c` default folder is `/zx`.
+  services. `aconfig.c` default folder is `/speccy`.
 
 ### Memory layout (`rp/src/memmap_rp.ld`)
 
@@ -253,20 +253,20 @@ the c2p worker.**
 
 ---
 
-## Architecture — the MD/ZX port (future-self notes)
+## Architecture — the MD/Speccy port (future-self notes)
 
 ### File layout
 
 - `rp/src/zx/` — **vendored emulator core**, kept close to upstream
   (MIT/zlib): `z80.h`, `zx.h`, `mem.h`, `kbd.h`, `chips_common.h`,
-  `clk.h`, `zx-roms.h`. Modifications are marked `MODIFIED (md-zx)`.
+  `clk.h`, `zx-roms.h`. Modifications are marked `MODIFIED (md-speccy)`.
 - `rp/src/zx/device_config.h` — replaces zx2040's per-board header. The
   button/keymap indirection was dropped (input is applied directly to the
   emulator in `zxemu.c`), so this now only carries `SPEAKER_PIN` and the
   `st77_*` display metrics the core and UI still reference.
 - `rp/src/zx/zx_config.h` — input-gate `#ifndef` fallbacks.
 - `rp/src/zx/builtin_game.h` — generated: the embedded demo `.z80`,
-  seeded into an empty `/zx`.
+  seeded into an empty `/speccy`.
 - `rp/src/zxemu.c` — **the port**: the emulator front-end (ported from
   zx2040's `zx.c`). Owns the `EMU` state, UI/menu, the ST→Spectrum key
   mapping, the VRAM→FB decode, audio fill, SD loading. Includes the
@@ -282,7 +282,7 @@ the c2p worker.**
 | ST77xx display driver | `update_display()` decodes 256×192 VRAM → `fb_chunked_buffer` at (32,4), one palette index/pixel, then `fb_publish()` |
 | GPIO buttons | `zxemu_handle_key()` applies ST keys directly via `zx_key_down/up`; the cursor cluster + ST joystick drive `zx_joystick()` (Kempston) |
 | PWM beeper on Core 1 | `zxemu_audio_fill` → YM (Core 1 freed for c2p) |
-| flash game blob | FatFs enum of `/zx`, `.z80` loaded via `zx_quickload` |
+| flash game blob | FatFs enum of `/speccy`, `.z80` loaded via `zx_quickload` |
 
 ### Display decode (validated offline)
 
@@ -369,12 +369,12 @@ channels. Approximate ("recognisable, not hi-fi").
 
 ### SD games
 
-`/zx` (config `ACONFIG_PARAM_FOLDER`). `populate_games_list()` enumerates
+`/speccy` (config `ACONFIG_PARAM_FOLDER`). `populate_games_list()` enumerates
 `.z80`; `load_game()` reads a snapshot **into the 64 KB
 `fb_chunked_buffer`** (borrowed as a transient load buffer — it's
 overwritten by the next render, so no permanent allocation) then
 `zx_quickload`. No game auto-loads: boot leaves the menu active so the
-user always picks. If `/zx` has no `.z80` files, the embedded
+user always picks. If `/speccy` has no `.z80` files, the embedded
 `builtin_game.h` demo is seeded there on first boot. (There is no keymap
 file any more — input is the direct mapping described above.)
 
@@ -389,7 +389,7 @@ reclaims that made it fit were:
    in `.data` RAM!); made `const` → flash. Keep them const.
 2. **ROM mapped from flash** — `zx.h` `zx_t.rom[1][0x4000]` (a 16 KB RAM
    copy) replaced with a `const uint8_t* rom0` pointer into the flash
-   array. `MODIFIED (md-zx)`.
+   array. `MODIFIED (md-speccy)`.
 3. **ROM3 ring 32 KB→4 KB** — `commemul.c COMM_RING_BITS` 15→12.
 4. Dropped a 50 KB `static zx_t im` from the unused `zx_load_snapshot`
    (it was already `--gc-sections`'d away, so this was cosmetic — the
@@ -435,7 +435,7 @@ PIO cart-bus timing — risky).
 | `the input device is not a TTY` (stcmd) | Export `STCMD_NO_TTY=1` before invoking `stcmd` from a non-TTY context. |
 | `arm-none-eabi-gcc not found` | Point `PICO_TOOLCHAIN_PATH` at the toolchain `bin` dir. |
 | `ERROR: cartridge code is N bytes; limit is 16384` | m68k cart grew past 16 KB. Trim `main.s` / `userfw.s` or move data into the shared region. |
-| Menu shows only the demo / is empty | SD not mounted or `/zx` unwritable, so the embedded demo couldn't be seeded and no games were found. The ROM boot screen still shows behind the menu. |
+| Menu shows only the demo / is empty | SD not mounted or `/speccy` unwritable, so the embedded demo couldn't be seeded and no games were found. The ROM boot screen still shows behind the menu. |
 | Final steps fail copying UF2 | An upstream compile failed — scroll back for the first error. |
 | Undefined ref to `vram_set_dirty_*` | They must be plain `void` functions (not C99 `inline`, which emits no symbol) since `mem.h` calls them. |
 
@@ -446,7 +446,7 @@ PIO cart-bus timing — risky).
   `rp/src/ff/ffconf.h` (project override wins via `BEFORE PRIVATE`).
 - Don't add features to `main.c` — start in `emul.c` / `zxemu.c`.
 - Keep vendored `rp/src/zx/*` close to upstream; mark any change
-  `MODIFIED (md-zx)` and preserve the original licence header. New files
+  `MODIFIED (md-speccy)` and preserve the original licence header. New files
   we author get the GPL-3.0-or-later header; don't stamp our copyright on
   vendored/template files we only tweak.
 - Match existing C style (`.clang-format` / `.clang-tidy`).

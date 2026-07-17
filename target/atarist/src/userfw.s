@@ -391,7 +391,7 @@ userfw:
     move.l  a0, VEC_TIMERB.w
     move.l  a0, VEC_TIMERA.w
 
-    ; md-zx: interrupt-driven IKBD -- install a real ACIA handler in
+    ; md-speccy: interrupt-driven IKBD -- install a real ACIA handler in
     ; place of the dummy rte so keyboard + joystick bytes are read the
     ; instant they arrive (the ACIA has a 1-byte buffer; polling loses
     ; the multi-byte joystick packets). Enabled at the MFP below.
@@ -468,13 +468,13 @@ userfw:
     bset    #0, MFP_IERA.w                ; Timer-B IRQ enable (IERA bit 0)
     bset    #0, MFP_IMRA.w                ; Timer-B IRQ unmask (IMRA bit 0)
 
-    bset    #MFP_ACIA_BIT, MFP_IERB.w     ; md-zx: enable keyboard/MIDI ACIA IRQ
+    bset    #MFP_ACIA_BIT, MFP_IERB.w     ; md-speccy: enable keyboard/MIDI ACIA IRQ
     bset    #MFP_ACIA_BIT, MFP_IMRB.w     ;         and unmask it
 
     ; Interrupts back on (caller's level, typically $2300).
     move.w  (sp)+, sr
 
-    ; --- md-zx: configure the IKBD for joystick play.
+    ; --- md-speccy: configure the IKBD for joystick play.
     ; $12 disables mouse reporting so only keyboard + joystick share the
     ; ACIA stream (mouse packets would otherwise desync the RP demux);
     ; $14 puts the IKBD in joystick event-reporting mode, so it emits

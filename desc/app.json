@@ -1,7 +1,7 @@
 {
   "uuid": "<APP_UUID>",
-  "name": "MD/ZX: ZX Spectrum 48K",
-  "description": "ZX Spectrum 48K emulator for the Atari ST. For more information, visit <a href=\"https://github.com/neilrackett/md-zx\">https://github.com/neilrackett/md-zx</a>.",
+  "name": "MD/Speccy: ZX Spectrum 48K",
+  "description": "ZX Spectrum 48K emulator for the Atari ST. For more information, visit <a href=\"https://github.com/neilrackett/md-speccy\">https://github.com/neilrackett/md-speccy</a>.",
   "image": "https://atarist.neilrackett.com/<APP_UUID>.png",
   "tags": [
     "Emulator",

@@ -1,34 +1,32 @@
 # Changelog
 
-## Unreleased
+## v1.0.0
 
-Ported the [zx2040](https://github.com/antirez/zx2040) ZX Spectrum 48K
-emulator (Andre Weissflog's `chips` core + Salvatore Sanfilippo's RP2040
-front-end, MIT) onto the framebuffer template as **MD/ZX**:
+First release of **MD/Speccy** — a ZX Spectrum 48K emulator for the
+Atari ST / STE / MegaST(E), ported from
+[zx2040](https://github.com/antirez/zx2040) (Andre Weissflog's `chips`
+core + Salvatore Sanfilippo's RP2040 front-end, MIT) onto the
+SidecarTridge framebuffer template.
 
 - **Display** — the Spectrum's 256×192 bitmap+attribute VRAM is decoded
-  directly into the chunked framebuffer, centred at (32, 4) in the
-  320×200 screen (border fills the margin), with the BRIGHT and FLASH
-  attributes honoured. The 16 ZX colours are published to the ST
-  shifter palette.
-- **Input** — Atari ST keyboard (cursor keys + space/return) drive the
-  emulator through zx2040's per-game keymap/macro system unchanged;
-  cursors/space map to Kempston.
+  directly into the chunked framebuffer, centred in the 320×200 screen
+  (border fills the margin), with BRIGHT and FLASH honoured. The 16 ZX
+  colours are published to the ST shifter palette.
+- **Keyboard** — the whole Atari ST keyboard maps positionally onto the
+  Spectrum: Shift → Caps Shift, Alt → Symbol Shift, Backspace/Delete →
+  Delete, Caps Lock, and punctuation (the matrix supplies Symbol Shift).
+- **Joystick / cursor** — the cursor cluster is a Kempston joystick, or
+  the Spectrum cursor keys via a menu setting; a real ST joystick works
+  as Kempston too, and Insert / Clr-Home are fire.
+- **Menu** — ESC opens a game picker + settings (volume, border, cursor
+  mode, …) with an about pop-over and an exit-to-GEM item; navigable by
+  keyboard or joystick.
 - **Audio** — the 1-bit Spectrum beeper is sampled and played out the
   YM2149 via the template's per-VBL fill callback (the RP2040 second
   core, previously used for PWM audio, is freed for the chunky→planar
   worker).
 - **Games** — `.z80` snapshots load from the SD app folder (default
-  `/zx`); `keymaps.txt` is read from there too, and written from a
-  firmware default on first boot.
-- **Phase gates** — `ZX_INPUT_KEYBOARD`, `ZX_AUDIO_YM`,
-  `ZX_GAMES_FROM_SD` and `ZX_INPUT_JOYSTICK` are CMake build options
-  (`cmake … -DZX_GAMES_FROM_SD=0`) so each capability can be tested in
-  isolation. With SD off, a single baked-in game runs without a card.
-- **ST joystick → Kempston** (`ZX_INPUT_JOYSTICK`, m68k `ZX_JOYSTICK`)
-  is implemented but **off by default and untested** — the template's
-  IKBD joystick path is documented-fragile; keyboard is the reliable
-  route.
+  `/speccy`); a small demo is seeded there when the folder is empty.
 
 RAM notes: the Spectrum ROM is mapped from flash (not copied to RAM),
 the ROM3 capture ring was shrunk 32 KB→4 KB (it only carries IKBD

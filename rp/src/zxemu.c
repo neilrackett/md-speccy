@@ -52,9 +52,18 @@ void vram_force_dirty(void);
 
 #define ZX_DEFAULT_SCANLINE_PERIOD 150
 
+// Spectrum display file: 6144 bytes of bitmap + 768 bytes of attributes.
+#define ZX_VRAM_SIZE 6912u
+
 // Blink phase for the Spectrum FLASH attribute, toggled by the frame
 // counter in zxemu_render_frame().
 static uint32_t zx_blink_phase = 0;
+
+// Scratch copy of the Spectrum VRAM. The menu / About overlay draws
+// destructively into VRAM, so we snapshot it here, draw, decode to the
+// framebuffer, then restore -- compositing the overlay for one frame
+// without leaving artifacts in VRAM once it's dismissed.
+static uint8_t s_vram_save[ZX_VRAM_SIZE];
 
 /* Modified for even RGB565 conversion. */
 static uint32_t zxpalette[16] = {
@@ -495,11 +504,11 @@ void ui_draw_menu(void) {
 // the About menu item and dismissed by any key / joystick press. Cell-aligned
 // (8 px grid) so the title can be tinted bright cyan and the body left white.
 static const char *AboutLines[] = {
-    "MD/ZX " RELEASE_VERSION,
+    "MD/Speccy " RELEASE_VERSION,
     "",
     "ZX Spectrum 48K emulator",
     "by Neil Rackett",
-    "x.com/neilrackett",
+    "neilrackett.com/atarist",
 };
 #define ABOUT_NLINES ((int)(sizeof(AboutLines) / sizeof(AboutLines[0])))
 
@@ -651,8 +660,8 @@ static int ends_with_z80(const char *name) {
            e[2] == '8' && e[3] == '0';
 }
 
-// SD app folder (from per-app config, default "/zx").
-static char zx_folder[64] = "/zx";
+// SD app folder (from per-app config, default "/speccy").
+static char zx_folder[64] = "/speccy";
 
 // Enumerate the app folder for .z80 snapshots.
 // Returns the number of games found.
@@ -922,17 +931,29 @@ void zxemu_render_frame(void) {
     // Run the Spectrum for one frame's worth of ticks.
     zx_exec(&EMU.zx, FRAME_USEC);
 
-    // Draw the menu over the emulated screen, or the About pop-over on top
-    // of it (the pop-over replaces the menu so nothing peeks out beside it).
-    if (EMU.about_active)     ui_draw_about();
-    else if (EMU.menu_active) ui_draw_menu();
-
     // Toggle the FLASH phase ~twice per second (every 16 frames).
     if ((EMU.tick & 0x0f) == 0) zx_blink_phase ^= 1u;
+
+    // Draw the menu, or the About pop-over on top of it (the pop-over
+    // replaces the menu so nothing peeks out beside it). Both draw into the
+    // Spectrum VRAM, so snapshot it first and restore it after the decode:
+    // the overlay is composited into the framebuffer for this frame only,
+    // never left behind in VRAM (a static game screen would otherwise never
+    // repaint the overwritten cells, leaving artifacts after dismissal).
+    uint8_t *vram = EMU.zx.ram[EMU.zx.display_ram_bank];
+    const bool overlay = EMU.about_active || EMU.menu_active;
+    if (overlay) {
+        memcpy(s_vram_save, vram, ZX_VRAM_SIZE);
+        if (EMU.about_active) ui_draw_about();
+        else                  ui_draw_menu();
+    }
 
     // Decode VRAM into the framebuffer and hand off to the ST (blocks
     // on the VBL, pacing this loop to 50 Hz).
     update_display();
+
+    if (overlay) memcpy(vram, s_vram_save, ZX_VRAM_SIZE);  // undo the overlay
+
     fb_publish();
 
     EMU.tick++;

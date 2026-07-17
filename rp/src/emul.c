@@ -55,12 +55,12 @@ static bool cart_check(const char *stage) {
 
 void emul_start() {
   // Games live in the app folder (per-app config
-  // ACONFIG_PARAM_FOLDER, default "/zx" from aconfig.c). The default is
-  // the right value -- a fresh config sector gets "/zx" and no MD/ZX
+  // ACONFIG_PARAM_FOLDER, default "/speccy" from aconfig.c). The default is
+  // the right value -- a fresh config sector gets "/speccy" and no MD/Speccy
   // build ever stored anything else -- so no runtime "healing" needed.
   SettingsConfigEntry *folder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
-  const char *folderName = folder ? folder->value : "/zx";
+  const char *folderName = folder ? folder->value : "/speccy";
 
   // Zero the whole 64 KB shared region so every byte the m68k can see is
   // deterministic, then copy the cartridge image into it.

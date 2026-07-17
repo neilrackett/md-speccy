@@ -145,7 +145,7 @@ typedef struct {
     uint64_t freq_hz;
     bool valid;
     uint8_t ram[3][0x4000];
-    /* MODIFIED (md-zx port): the 48K ROM copy was replaced with a
+    /* MODIFIED (md-speccy port): the 48K ROM copy was replaced with a
      * pointer to the ROM image in flash to save 16 KB of RP2040 RAM.
      * The Z80 never writes ROM, so mapping the const flash array
      * directly is safe. */
@@ -818,7 +818,7 @@ bool zx_load_snapshot(zx_t* sys, uint32_t version, zx_t* src) {
     if (version != ZX_SNAPSHOT_VERSION) {
         return false;
     }
-    /* MODIFIED (md-zx port): dropped the 50 KB `static zx_t im` scratch.
+    /* MODIFIED (md-speccy port): dropped the 50 KB `static zx_t im` scratch.
      * This port never restores snapshots and the RP2040 cannot spare a
      * second full machine image in RAM; rebased in place instead. */
     *sys = *src;
