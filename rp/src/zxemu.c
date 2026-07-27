@@ -43,7 +43,8 @@ void vram_force_dirty(void);
 #include "sdcard.h"
 #include "aconfig.h"
 #include "settings/settings.h"
-#include "builtin_game.h"     // embedded demo seeded into an empty /zx
+#include "builtin_game.h"      // embedded games seeded into the app folder
+#include "builtin_pongwars.h"
 
 // The Spectrum bitmap (256x192) is shown 1:1, centred in the 320x200
 // framebuffer; the surrounding margin is the Spectrum border.
@@ -91,7 +92,18 @@ void load_game(int game_id);
 
 #define ZX_MAX_GAMES     128    // Max .z80 snapshots listed from SD.
 #define ZX_YM_VOLUME     12     // YM 4-bit volume for beeper "high".
-#define ZX_DEMO_FILENAME "3dshow_demo.z80"  // seeded into an empty /zx folder
+
+// Snapshots baked into the firmware (flash) and seeded into the app
+// folder on boot -- see populate_games_list().
+static const struct {
+    const char *name;
+    const uint8_t *data;
+    uint32_t size;
+} BuiltinGames[] = {
+    {"3dshow_demo.z80", zx_builtin_game,     zx_builtin_game_len},
+    {"pongwars.z80",    zx_builtin_pongwars, zx_builtin_pongwars_len},
+};
+#define ZX_BUILTIN_GAMES (sizeof(BuiltinGames) / sizeof(BuiltinGames[0]))
 
 struct game_entry {
     char name[28];          // Z80 snapshot filename (SD) or label.
@@ -692,27 +704,27 @@ int populate_games_list(void) {
     }
     f_closedir(&dir);
 
-    // Make sure the embedded demo is always present in the folder,
+    // Make sure the embedded games are always present in the folder,
     // regardless of what else is there. FA_CREATE_NEW fails harmlessly if
-    // it already exists (FAT names are case-insensitive), in which case
+    // one already exists (FAT names are case-insensitive), in which case
     // the scan above already listed it; otherwise we write it and add it.
-    // It's a normal file the user can delete -- it just reappears next
+    // They're normal files the user can delete -- they just reappear next
     // boot.
-    if (GamesTableSize < ZX_MAX_GAMES) {
+    for (unsigned i = 0; i < ZX_BUILTIN_GAMES && GamesTableSize < ZX_MAX_GAMES;
+         i++) {
         char path[96];
-        snprintf(path, sizeof(path), "%s/%s", zx_folder, ZX_DEMO_FILENAME);
+        snprintf(path, sizeof(path), "%s/%s", zx_folder, BuiltinGames[i].name);
         FIL f;
-        if (f_open(&f, path, FA_CREATE_NEW | FA_WRITE) == FR_OK) {
-            UINT bw = 0;
-            f_write(&f, zx_builtin_game, zx_builtin_game_len, &bw);
-            f_close(&f);
-            if (bw == zx_builtin_game_len) {
-                struct game_entry *ge = &GamesTable[GamesTableSize++];
-                strncpy(ge->name, ZX_DEMO_FILENAME, sizeof(ge->name) - 1);
-                ge->name[sizeof(ge->name) - 1] = 0;
-                ge->addr = NULL;
-                ge->size = zx_builtin_game_len;
-            }
+        if (f_open(&f, path, FA_CREATE_NEW | FA_WRITE) != FR_OK) continue;
+        UINT bw = 0;
+        f_write(&f, BuiltinGames[i].data, BuiltinGames[i].size, &bw);
+        f_close(&f);
+        if (bw == BuiltinGames[i].size) {
+            struct game_entry *ge = &GamesTable[GamesTableSize++];
+            strncpy(ge->name, BuiltinGames[i].name, sizeof(ge->name) - 1);
+            ge->name[sizeof(ge->name) - 1] = 0;
+            ge->addr = NULL;
+            ge->size = BuiltinGames[i].size;
         }
     }
     return (int)GamesTableSize;

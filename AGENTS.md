@@ -87,8 +87,8 @@ Override from the root Makefile, e.g. `ZX_INPUT_KEYBOARD=0 make build`.
 
 (The earlier `ZX_AUDIO_YM`, `ZX_GAMES_FROM_SD` and `ZX_INPUT_JOYSTICK`
 gates were removed once those paths were confirmed working on hardware.
-`builtin_game.h` is still used — the embedded demo is seeded into an
-empty `/speccy` folder. The old `builtin_keymaps.h` / `keymaps.txt` system
+`builtin_game.h` / `builtin_pongwars.h` are still used — the embedded
+games are seeded into `/speccy`. The old `builtin_keymaps.h` / `keymaps.txt` system
 was dropped when input moved to a direct ST→Spectrum keyboard mapping.)
 
 ### Build gotchas
@@ -265,8 +265,11 @@ the c2p worker.**
   emulator in `zxemu.c`), so this now only carries `SPEAKER_PIN` and the
   `st77_*` display metrics the core and UI still reference.
 - `rp/src/zx/zx_config.h` — input-gate `#ifndef` fallbacks.
-- `rp/src/zx/builtin_game.h` — generated: the embedded demo `.z80`,
-  seeded into an empty `/speccy`.
+- `rp/src/zx/builtin_game.h`, `rp/src/zx/builtin_pongwars.h` — generated
+  by `tools/z80_to_header.py`: the embedded `.z80` snapshots, seeded into
+  `/speccy`. To add another, run the tool and append a row to
+  `BuiltinGames[]` in `zxemu.c`. The arrays are `const` → flash, so they
+  cost no RAM.
 - `rp/src/zxemu.c` — **the port**: the emulator front-end (ported from
   zx2040's `zx.c`). Owns the `EMU` state, UI/menu, the ST→Spectrum key
   mapping, the VRAM→FB decode, audio fill, SD loading. Includes the
@@ -374,8 +377,9 @@ channels. Approximate ("recognisable, not hi-fi").
 `fb_chunked_buffer`** (borrowed as a transient load buffer — it's
 overwritten by the next render, so no permanent allocation) then
 `zx_quickload`. No game auto-loads: boot leaves the menu active so the
-user always picks. If `/speccy` has no `.z80` files, the embedded
-`builtin_game.h` demo is seeded there on first boot. (There is no keymap
+user always picks. After the scan, each entry in `BuiltinGames[]` is
+written to `/speccy` with `FA_CREATE_NEW` — present already, nothing
+happens; deleted by the user, it reappears next boot. (There is no keymap
 file any more — input is the direct mapping described above.)
 
 ### RAM budget — CRITICAL, read before adding statics
@@ -435,7 +439,7 @@ PIO cart-bus timing — risky).
 | `the input device is not a TTY` (stcmd) | Export `STCMD_NO_TTY=1` before invoking `stcmd` from a non-TTY context. |
 | `arm-none-eabi-gcc not found` | Point `PICO_TOOLCHAIN_PATH` at the toolchain `bin` dir. |
 | `ERROR: cartridge code is N bytes; limit is 16384` | m68k cart grew past 16 KB. Trim `main.s` / `userfw.s` or move data into the shared region. |
-| Menu shows only the demo / is empty | SD not mounted or `/speccy` unwritable, so the embedded demo couldn't be seeded and no games were found. The ROM boot screen still shows behind the menu. |
+| Menu shows only the built-ins / is empty | SD not mounted or `/speccy` unwritable, so the embedded games couldn't be seeded and no games were found. The ROM boot screen still shows behind the menu. |
 | Final steps fail copying UF2 | An upstream compile failed — scroll back for the first error. |
 | Undefined ref to `vram_set_dirty_*` | They must be plain `void` functions (not C99 `inline`, which emits no symbol) since `mem.h` calls them. |
 
