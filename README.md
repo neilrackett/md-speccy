@@ -8,9 +8,9 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 MD/Speccy turns your SidecarT into a ZX Spectrum 48K running on your Atari ST!
 
-Any game in `.z80` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card.
+Don't have any games yet? Don't worry, MD/Speccy comes with 2 built-in demos, including my own ZX Spectrum port of [Pong Wars](https://github.com/neilrackett/zxspectrum-pongwars/releases), and there are loads of classic games available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) and [World of Spectrum](https://worldofspectrum.org/).
 
-Don't have any games yet? Don't worry, MD/Speccy comes with a built-in demo.
+Any game in `.z80` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card and they'll appear on the menu.
 
 Ported from Andre Weissflog's [`chips`](https://github.com/floooh/chips), via Salvatore Sanfilippo's [zx2040](https://github.com/antirez/zx2040), so a massive thank you to both of them for their fantastic work!
 
@@ -38,7 +38,7 @@ Caps Lock.
 
 A real ST joystick works as Kempston too.
 
-Choose **exit** in the menu to quit back to GEM.
+The menu also has an **about** item (version and credits) and an **exit** item to quit back to GEM.
 
 ## Installation
 
@@ -54,12 +54,6 @@ Choose **exit** in the menu to quit back to GEM.
 - Atari ST, STE, MegaST, or MegaSTE (low or medium resolution — high-res falls back to GEM)
 - A microSD card for your games
 - Raspberry Pi Debug Probe or Picoprobe for flashing/debugging (optional, for development)
-
-## Games
-
-Any games in `.z80` format are supported, just copy them into the `/speccy` folder on your SD card for MD/Speccy to find them; there are loads of classic games currently available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) and [World of Spectrum](https://worldofspectrum.org/) if you don't have any already.
-
-On first boot, if `/speccy` has no games in it, MD/Speccy seeds a small demo (`3dshow_demo.z80`) so there's always something in the menu.
 
 ## How it works
 
