@@ -57,7 +57,7 @@ Choose **exit** in the menu to quit back to GEM.
 
 ## Games
 
-Any games in `.z80` format are supported, just copy them into the `/speccy` folder on your SD card for MD/Speccy to find them; there are loads of classic games currently available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) if you don't have any already.
+Any games in `.z80` format are supported, just copy them into the `/speccy` folder on your SD card for MD/Speccy to find them; there are loads of classic games currently available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) and [World of Spectrum](https://worldofspectrum.org/) if you don't have any already.
 
 On first boot, if `/speccy` has no games in it, MD/Speccy seeds a small demo (`3dshow_demo.z80`) so there's always something in the menu.
 
