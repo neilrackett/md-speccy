@@ -285,7 +285,7 @@ the c2p worker.**
 | ST77xx display driver | `update_display()` decodes 256×192 VRAM → `fb_chunked_buffer` at (32,4), one palette index/pixel, then `fb_publish()` |
 | GPIO buttons | `zxemu_handle_key()` applies ST keys directly via `zx_key_down/up`; the cursor cluster + ST joystick drive `zx_joystick()` (Kempston) |
 | PWM beeper on Core 1 | `zxemu_audio_fill` → YM (Core 1 freed for c2p) |
-| flash game blob | FatFs enum of `/speccy`, `.z80` loaded via `zx_quickload` |
+| flash game blob | FatFs enum of `/speccy`, `.z80` via `zx_quickload`, `.sna` via `zx_quickload_sna` |
 
 ### Display decode (validated offline)
 
@@ -366,17 +366,32 @@ it back to the menu.
 
 `zxemu_audio_fill(buf, bytes)` decimates the beeper. The emulator samples
 the 1-bit beeper into `zx.audiobuf` during `zx_exec` (enabled because
-`SPEAKER_PIN != -1`); the callback takes the bits produced since the last
-fill and maps each to full/zero YM volume (`ZX_YM_VOLUME`) on both
-channels. Approximate ("recognisable, not hi-fi").
+`SPEAKER_PIN != -1`; one bit per 16 ticks into a 256×32-bit ring). Each
+per-VBL fill box-filters the ~5.5 K bits since the last fill into 112
+output windows whose bounds tile the span exactly (Bresenham — a fixed
+`avail/nsamp` step used to drop the division remainder, ~0.4 ms of
+timeline per fill, phase-jumping every sustained tone at 50 Hz), then
+maps each window's duty cycle through `duty_att[]` (round(−2·log₂ duty)
+YM steps below the menu-volume peak) so linear amplitude tracks duty on
+the YM's ~3 dB/step logarithmic DAC — a plain `duty*vmax` companded the
+filtered edges into near-silence. Same level on both channels. Template
+side, the refill gate `AUDIO_FRAME_PERIOD_US` (audio.c) is 15 ms: at
+20 ms it raced the ~20.03 ms ST PAL VBL, and a lost race skipped a fill,
+replaying a stale buffer for a frame while the producer overran the ring
+(the old intermittent distortion). Approximate ("recognisable, not
+hi-fi").
 
 ### SD games
 
 `/speccy` (config `ACONFIG_PARAM_FOLDER`). `populate_games_list()` enumerates
-`.z80`; `load_game()` reads a snapshot **into the 64 KB
-`fb_chunked_buffer`** (borrowed as a transient load buffer — it's
-overwritten by the next render, so no permanent allocation) then
-`zx_quickload`. No game auto-loads: boot leaves the menu active so the
+`.z80` and `.sna` (`snapshot_type()` classifies by extension);
+`load_game()` reads a snapshot **into the 64 KB `fb_chunked_buffer`**
+(borrowed as a transient load buffer — it's overwritten by the next
+render, so no permanent allocation) then `zx_quickload` (.z80) or
+`zx_quickload_sna` (.sna — 48K only: 27-byte header + raw 48 KB dump,
+PC popped RETN-style off the snapshot stack; 128K images are a
+different size and are rejected. Lives in `zxemu.c`, not the vendored
+core). No game auto-loads: boot leaves the menu active so the
 user always picks. After the scan, each entry in `BuiltinGames[]` is
 written to `/speccy` with `FA_CREATE_NEW` — present already, nothing
 happens; deleted by the user, it reappears next boot. (There is no keymap

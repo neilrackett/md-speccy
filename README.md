@@ -10,7 +10,7 @@ MD/Speccy turns your SidecarT into a ZX Spectrum 48K running on your Atari ST!
 
 Don't have any games yet? Don't worry, MD/Speccy comes with 2 built-in demos, including my own ZX Spectrum port of [Pong Wars](https://github.com/neilrackett/zxspectrum-pongwars/releases), and there are loads of classic games available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) and [World of Spectrum](https://worldofspectrum.org/).
 
-Any game in `.z80` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card and they'll appear on the menu.
+Any 48K game in `.z80` or `.sna` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card and they'll appear on the menu. (MD/Speccy is a 48K Spectrum, so 128K-only games and 128K snapshots won't run.)
 
 Ported from Andre Weissflog's [`chips`](https://github.com/floooh/chips), via Salvatore Sanfilippo's [zx2040](https://github.com/antirez/zx2040), so a massive thank you to both of them for their fantastic work!
 
@@ -44,7 +44,7 @@ The menu also has an **about** item (version and credits) and an **exit** item t
 
 1. Download the latest `.uf2` and `.json` from the [releases page](https://github.com/neilrackett/md-speccy/releases).
 2. Copy both files to the `/apps` folder of your SidecarT's microSD card.
-3. Optionally, copy your `.z80` Spectrum games into a `/speccy` folder on the same microSD card.
+3. Optionally, copy your `.z80` or `.sna` Spectrum games into a `/speccy` folder on the same microSD card.
 4. On the Booster screen, press ESC for the app list and select MD/Speccy.
 5. To return to Booster, power on your ST while holding the SELECT button on your SidecarT.
 

@@ -56,6 +56,11 @@ void vram_force_dirty(void);
 // Spectrum display file: 6144 bytes of bitmap + 768 bytes of attributes.
 #define ZX_VRAM_SIZE 6912u
 
+// Snapshot filename classification (defined in the game-storage section;
+// the menu renderer uses it to hide the extension).
+enum { SNAP_NONE = 0, SNAP_Z80, SNAP_SNA };
+static int snapshot_type(const char *name);
+
 // Blink phase for the Spectrum FLASH attribute, toggled by the frame
 // counter in zxemu_render_frame().
 static uint32_t zx_blink_phase = 0;
@@ -90,8 +95,7 @@ void load_game(int game_id);
 
 /* =============================== Games list =============================== */
 
-#define ZX_MAX_GAMES     128    // Max .z80 snapshots listed from SD.
-#define ZX_YM_VOLUME     12     // YM 4-bit volume for beeper "high".
+#define ZX_MAX_GAMES     128    // Max .z80/.sna snapshots listed from SD.
 
 // Snapshots baked into the firmware (flash) and seeded into the app
 // folder on boot -- see populate_games_list().
@@ -487,16 +491,13 @@ void ui_draw_menu(void) {
         for (int cx = menu_x >> 3; cx < 32; cx++)
             vmem[0x1800 + (cy << 5) + cx] = attr;
 
-        // Build the display text (game name with any ".z80" hidden).
+        // Build the display text (game name with any ".z80"/".sna" hidden).
         char line[40];
         if (is_game) {
             strncpy(line, GamesTable[j].name, sizeof(line) - 1);
             line[sizeof(line) - 1] = 0;
             size_t n = strlen(line);
-            if (n >= 4 && line[n-4] == '.' &&
-                (line[n-3] == 'z' || line[n-3] == 'Z') &&
-                line[n-2] == '8' && line[n-1] == '0')
-                line[n-4] = 0;
+            if (snapshot_type(line)) line[n-4] = 0;
         } else {
             settings_to_string(line, sizeof(line), -j - 1);
         }
@@ -661,21 +662,62 @@ void set_volume(uint32_t volume) {
 
 /* =============================== Game storage ============================= */
 
-// Case-insensitive ".z80" extension test (FatFs may hand back either an
-// LFN with original case or an upper-case 8.3 short name).
-static int ends_with_z80(const char *name) {
+// Case-insensitive snapshot extension test (FatFs may hand back either an
+// LFN with original case or an upper-case 8.3 short name). Both supported
+// extensions are 4 chars, so stripping one is always name[n-4] = 0.
+static int snapshot_type(const char *name) {
     size_t n = strlen(name);
-    if (n < 4) return 0;
+    if (n < 4) return SNAP_NONE;
     const char *e = name + n - 4;
-    return e[0] == '.' &&
-           (e[1] == 'z' || e[1] == 'Z') &&
-           e[2] == '8' && e[3] == '0';
+    if (e[0] != '.') return SNAP_NONE;
+    if ((e[1] == 'z' || e[1] == 'Z') && e[2] == '8' && e[3] == '0')
+        return SNAP_Z80;
+    if ((e[1] == 's' || e[1] == 'S') &&
+        (e[2] == 'n' || e[2] == 'N') &&
+        (e[3] == 'a' || e[3] == 'A'))
+        return SNAP_SNA;
+    return SNAP_NONE;
+}
+
+// Load a 48K .sna snapshot: a 27-byte register header followed by a raw
+// 48 KB dump of $4000-$FFFF (no compression). PC is not in the header --
+// the save pushed it onto the stack, so loading emulates RETN: pop PC,
+// SP += 2, IFF2 -> IFF1. 128K .sna images are a different size and are
+// rejected (this is a 48K machine).
+static bool zx_quickload_sna(zx_t *sys, chips_range_t data) {
+    if (data.size != 27 + 0xC000) return false;
+    const uint8_t *h = data.ptr;
+    memcpy(sys->ram[0], h + 27, 0x4000);            // $4000
+    memcpy(sys->ram[1], h + 27 + 0x4000, 0x4000);   // $8000
+    memcpy(sys->ram[2], h + 27 + 0x8000, 0x4000);   // $C000
+    z80_reset(&sys->cpu);
+    sys->cpu.i   = h[0];
+    sys->cpu.hl2 = (h[2] << 8) | h[1];
+    sys->cpu.de2 = (h[4] << 8) | h[3];
+    sys->cpu.bc2 = (h[6] << 8) | h[5];
+    sys->cpu.af2 = (h[8] << 8) | h[7];
+    sys->cpu.l = h[9];  sys->cpu.h = h[10];
+    sys->cpu.e = h[11]; sys->cpu.d = h[12];
+    sys->cpu.c = h[13]; sys->cpu.b = h[14];
+    sys->cpu.iy = (h[16] << 8) | h[15];
+    sys->cpu.ix = (h[18] << 8) | h[17];
+    sys->cpu.iff1 = sys->cpu.iff2 = (h[19] & (1 << 2)) != 0;
+    sys->cpu.r = h[20];
+    sys->cpu.f = h[21]; sys->cpu.a = h[22];
+    uint16_t sp = (h[24] << 8) | h[23];
+    sys->cpu.im = h[25] & 3;
+    uint16_t pc = mem_rd(&sys->mem, sp) |
+                  (mem_rd(&sys->mem, (uint16_t)(sp + 1)) << 8);
+    sys->cpu.sp = (uint16_t)(sp + 2);
+    sys->pins = z80_prefetch(&sys->cpu, pc);
+    sys->border_color = h[26] & 7;
+    return true;
 }
 
 // SD app folder (from per-app config, default "/speccy").
 static char zx_folder[64] = "/speccy";
 
-// Enumerate the app folder for .z80 snapshots.
+// Enumerate the app folder for .z80 / .sna snapshots.
 // Returns the number of games found.
 int populate_games_list(void) {
     SettingsConfigEntry *fe =
@@ -695,7 +737,7 @@ int populate_games_list(void) {
         if (fno.fattrib & AM_DIR) continue;
         if (fno.fname[0] == '.') continue;   // skip dot / AppleDouble (._*.z80)
         if (fno.fattrib & (AM_HID | AM_SYS)) continue;
-        if (!ends_with_z80(fno.fname)) continue;
+        if (!snapshot_type(fno.fname)) continue;
         struct game_entry *ge = &GamesTable[GamesTableSize++];
         strncpy(ge->name, fno.fname, sizeof(ge->name) - 1);
         ge->name[sizeof(ge->name) - 1] = 0;
@@ -791,7 +833,7 @@ void load_game(int game_id) {
 
     // Borrow the chunked framebuffer as a transient load buffer -- it is
     // overwritten by the next update_display() anyway, so this avoids a
-    // permanent ~50 KB allocation for the .z80 image.
+    // permanent ~50 KB allocation for the snapshot image.
     char path[96];
     snprintf(path, sizeof(path), "%s/%s", zx_folder, g->name);
     FIL f;
@@ -802,7 +844,10 @@ void load_game(int game_id) {
     f_read(&f, fb_chunked_buffer, cap, &br);
     f_close(&f);
     chips_range_t r = { .ptr = fb_chunked_buffer, .size = br };
-    zx_quickload(&EMU.zx, r);
+    if (snapshot_type(g->name) == SNAP_SNA)
+        zx_quickload_sna(&EMU.zx, r);
+    else
+        zx_quickload(&EMU.zx, r);
 
     EMU.loaded_game = game_id;
 }
@@ -971,11 +1016,19 @@ void zxemu_render_frame(void) {
     EMU.tick++;
 }
 
+// round(-2*log2(q/32)) for q = 0..32: attenuation in YM volume steps
+// below peak that makes linear output amplitude track a duty cycle of
+// q/32 on the YM's logarithmic DAC (~3 dB, i.e. ~1/sqrt(2) amplitude,
+// per step). q = 0 is silence (255 attenuates everything).
+static const uint8_t duty_att[33] = {
+    255, 10, 8, 7, 6, 5, 5, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2,
+    2,   2,  2, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+};
+
 void zxemu_audio_fill(uint8_t *buf, uint32_t bytes) {
     // The emulator samples the 1-bit beeper into zx.audiobuf during
     // zx_exec(). Decimate the bits produced since the last fill down to
-    // the ~112 samples the m68k Timer-B handler consumes per VBL, and
-    // map each to a full/zero YM volume on both channels.
+    // the ~112 samples the m68k Timer-B handler consumes per VBL.
     const uint32_t nsamp = bytes / 2;
     const uint32_t total = AUDIOBUF_LEN * 32;   // total beeper-sample bits
     static uint32_t rd = 0;                     // last consumed bit index
@@ -992,21 +1045,29 @@ void zxemu_audio_fill(uint8_t *buf, uint32_t bytes) {
         return;
     }
 
-    // Box-filter decimation: average the `step` beeper bits that fall in
-    // each output sample's window (i.e. the local duty cycle) and map that
-    // to a graduated YM volume. This low-passes the 1-bit signal instead
-    // of point-sampling one bit, which removes most of the aliasing that
-    // made the raw beeper sound harsh.
-    const uint32_t step = avail / nsamp;
+    // Box-filter decimation: average the beeper bits that fall in each
+    // output sample's window (the local duty cycle). The window bounds
+    // tile `avail` exactly (Bresenham) -- a fixed avail/nsamp step used
+    // to drop the division remainder, skipping ~0.4 ms of audio timeline
+    // per fill, which phase-jumped every sustained tone 50 times a second.
     uint32_t idx = rd;
+    uint32_t taken = 0;
     for (uint32_t i = 0; i < nsamp; i++) {
+        const uint32_t end = (avail * (i + 1)) / nsamp;
+        const uint32_t n = end - taken;
         uint32_t ones = 0;
-        for (uint32_t s = 0; s < step; s++) {
+        for (; taken < end; taken++) {
             ones += (EMU.zx.audiobuf[(idx >> 5) & (AUDIOBUF_LEN - 1)]
                      >> (idx & 31)) & 1u;
             idx++;
         }
-        uint8_t v = (uint8_t)((ones * vmax) / step);   // duty cycle -> volume
+        // Duty -> YM level via duty_att[]: the DAC is logarithmic, so a
+        // linear duty*vmax mapping companded the filtered edge samples
+        // into near-silence (undoing the low-pass and adding harmonics).
+        // Attenuating in log steps keeps amplitude proportional to duty.
+        const uint32_t q = (ones * 32u + n / 2u) / n;   // duty in 32nds
+        const uint8_t att = duty_att[q];
+        const uint8_t v = (att >= vmax) ? 0 : (uint8_t)(vmax - att);
         buf[2*i] = v;
         buf[2*i+1] = v;
     }

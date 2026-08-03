@@ -25,10 +25,15 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 
-/* Per-VBL fill cadence. Refill every ~20 ms (one PAL VBL) so the
- * RP keeps pace with the m68k's Timer-B reads without burning more
- * main-loop cycles than necessary. */
-#define AUDIO_FRAME_PERIOD_US 20000u
+/* Per-VBL fill cadence. The gate only exists to reject re-entry from a
+ * main loop that spins faster than the VBL; it must never skip a fill
+ * in a VBL-locked loop (every fb app blocks on fb_publish). The ST PAL
+ * VBL is ~20,032 us, so the old 20,000 us threshold left ~30 us of
+ * margin -- one jittery time_us_32() reading skipped a fill, and the
+ * m68k then replayed the previous 224 B buffer for a whole frame while
+ * the producer overran its ring. 15 ms still rejects sub-VBL re-entry
+ * but can never lose the race against a real VBL. */
+#define AUDIO_FRAME_PERIOD_US 15000u
 
 /* m68k Timer-B consumption per PAL VBL. Must stay in sync with the
  * Timer-B rate in target/atarist/src/userfw.s:
