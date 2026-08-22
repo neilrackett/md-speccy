@@ -21,6 +21,8 @@
 #include "fb.h"
 #include "fb_chunked.h"
 #include "palette.h"
+#include "cart_shared.h"  // __cart_app_free() for the buffers parked below
+#include "debug.h"
 #include "zxemu.h"
 
 #include "device_config.h" // Audio / display metrics.
@@ -69,7 +71,12 @@ static uint32_t zx_blink_phase = 0;
 // destructively into VRAM, so we snapshot it here, draw, decode to the
 // framebuffer, then restore -- compositing the overlay for one frame
 // without leaving artifacts in VRAM once it's dismissed.
-static uint8_t s_vram_save[ZX_VRAM_SIZE];
+static uint8_t s_vram_save[ZX_VRAM_SIZE] __cart_app_free("vram_save");
+
+// Beeper sample ring storage for zx_t.audiobuf (a pointer since the
+// md-speccy port -- see zx.h). Uncleared is fine: the consumer only
+// reads bits the producer has written.
+static uint32_t zx_audiobuf_store[AUDIOBUF_LEN] __cart_app_free("audiobuf");
 
 /* Modified for even RGB565 conversion. */
 static uint32_t zxpalette[16] = {
@@ -95,7 +102,9 @@ void load_game(int game_id);
 
 /* =============================== Games list =============================== */
 
-#define ZX_MAX_GAMES     128    // Max .z80/.sna snapshots listed from SD.
+#define ZX_MAX_GAMES     64     // Max .z80/.sna snapshots listed from SD
+                                // (bounded by the cart-hole RAM GamesTable
+                                // lives in; the scan stops cleanly at the cap).
 
 // Snapshots baked into the firmware (flash) and seeded into the app
 // folder on boot -- see populate_games_list().
@@ -117,7 +126,7 @@ struct game_entry {
 
 // Populated during initialization from the SD app folder (or the single
 // baked-in game). Static storage -- no heap fragmentation.
-struct game_entry GamesTable[ZX_MAX_GAMES];
+struct game_entry GamesTable[ZX_MAX_GAMES] __cart_app_free("games");
 uint32_t GamesTableSize;
 
 /* ==================== Atari ST keyboard -> ZX Spectrum ==================== */
@@ -186,21 +195,9 @@ static uint8_t zx_cursor_kempston = 0;
 
 /* ========================== Global state and defines ====================== */
 
-// Don't trust this USEC figure here, since the z80.h file implementation
-// is modified to glue together the instruction fetch steps, so we do
-// more work per tick.
-#define FRAME_USEC (25000)
-
 struct emustate {
     zx_t zx;    // The emulator state.
     int debug;  // Debugging mode
-
-    // We switch betweent wo clocks: one is selected just for zx_exec(), that
-    // is the most speed critical code path. For all the other code execution
-    // we stay to a lower overclocking mode that is low enough to allow the
-    // flash memory to be accessed without issues.
-    uint32_t base_clock;
-    uint32_t emu_clock;
 
     uint32_t tick; // Frame number since last game load.
 
@@ -233,7 +230,25 @@ struct emustate {
     uint8_t dirty_vram[24]; // Track rows that changed since last update.
     uint8_t last_update_border_color; // Track last border color to update the
                                       // screen border only if it changed.
+
+    // Speed sampling, averaged over a ~1 s window by zxemu_render_frame()
+    // and reported in the About pop-over.
+    uint32_t perf_exec_us;   // Mean zx_exec() time per emulated frame.
+    uint32_t perf_disp_us;   // Mean display path (overlay + decode) time.
+    uint32_t perf_pub_us;    // Mean fb_publish() (transpose+wait+copy) time.
+    uint32_t perf_fps_x10;   // Achieved frames per second, in tenths.
 } EMU;
+
+// Emulated microseconds to ask zx_exec() for, for one displayed frame.
+// zx_exec() always runs on to the end of the bitmap (scanline 256), so
+// any request longer than one scanline and shorter than 256 of them
+// advances exactly one emulated frame per call; 200 scanlines sits in
+// the middle of that window for every scanline_period the menu allows.
+// (Full history and the upstream contrast: AGENTS.md "Frame pacing".)
+static inline uint32_t zx_frame_usec(void) {
+    return (uint32_t)(200ull * (uint32_t)EMU.zx.scanline_period * 1000000ull /
+                      EMU.zx.freq_hz);
+}
 
 /* ========================== Emulator user interface ======================= */
 
@@ -522,8 +537,17 @@ static const char *AboutLines[] = {
     "ZX Spectrum 48K emulator",
     "by Neil Rackett",
     "neilrackett.com/atarist",
+    "",
+    NULL,   // speed readout, filled in below
+    NULL,   // display/publish breakdown, filled in below
 };
 #define ABOUT_NLINES ((int)(sizeof(AboutLines) / sizeof(AboutLines[0])))
+
+// Backing store for the two patched-in stats lines above.
+static char AboutStats[2][28];
+
+// Format a microsecond count as "N.M" milliseconds (two printf args).
+#define MS(us) (unsigned long)((us) / 1000u), (unsigned long)(((us) % 1000u) / 100u)
 
 void ui_draw_about(void) {
     const int box_cw = 26;                       // width in cells (chars)
@@ -549,6 +573,19 @@ void ui_draw_about(void) {
     for (int cx = cx0; cx < cx1; cx++)
         vmem[0x1800 + ((cy0 + 1) << 5) + cx] = 0x45;
 
+    // Live speed readout: emulation time per frame against the 20 ms PAL
+    // VBL budget, and the frame rate actually achieved. Both are sampled in
+    // zxemu_render_frame() and include this pop-over's own compositing
+    // cost, so they read a little below the in-play figures.
+    snprintf(AboutStats[0], sizeof(AboutStats[0]), "emu %lu.%lums  fps %lu.%lu",
+             MS(EMU.perf_exec_us),
+             (unsigned long)(EMU.perf_fps_x10 / 10u),
+             (unsigned long)(EMU.perf_fps_x10 % 10u));
+    snprintf(AboutStats[1], sizeof(AboutStats[1]), "dsp %lu.%lums  pub %lu.%lums",
+             MS(EMU.perf_disp_us), MS(EMU.perf_pub_us));
+    AboutLines[ABOUT_NLINES - 2] = AboutStats[0];
+    AboutLines[ABOUT_NLINES - 1] = AboutStats[1];
+
     for (int i = 0; i < ABOUT_NLINES; i++) {
         const char *s = AboutLines[i];
         int len = (int)strlen(s);
@@ -564,14 +601,14 @@ void ui_draw_about(void) {
 // Set a bitmap signaling which part of the screen RAM was touched and
 // is yet to be updated on the display. This function is called when the
 // address 'addr' is in the range of the VRAM bitmap area.
-void vram_set_dirty_bitmap(uint16_t addr) {
+void __not_in_flash_func(vram_set_dirty_bitmap)(uint16_t addr) {
     uint16_t y = ((addr&0x1800)>>5) | ((addr&0x700)>>8) | ((addr&0xe0)>>2);
     EMU.dirty_vram[y>>3] |= 1 << (y&7);
 }
 
 // Like vram_set_dirty_bitmap() but called for addresses in the range
 // of the color attributes.
-void vram_set_dirty_attr(uint16_t addr) {
+void __not_in_flash_func(vram_set_dirty_attr)(uint16_t addr) {
     // Mark all the 8 rows affected in one operation.
     EMU.dirty_vram[((addr-0x5800)>>5) & 31] = 0xff;
 }
@@ -604,26 +641,51 @@ void zx_set_palette(void) {
     }
 }
 
+// Nibble -> byte-lane mask for the decode below: bit 3 of the nibble
+// (the leftmost of its 4 pixels) selects byte lane 0 of a little-endian
+// word. Validated offline against the byte-wise loop it replaced, over
+// every (bits, attr, blink) combination.
+static const uint32_t zx_nib_mask[16] = {
+    0x00000000u, 0xFF000000u, 0x00FF0000u, 0xFFFF0000u,
+    0x0000FF00u, 0xFF00FF00u, 0x00FFFF00u, 0xFFFFFF00u,
+    0x000000FFu, 0xFF0000FFu, 0x00FF00FFu, 0xFFFF00FFu,
+    0x0000FFFFu, 0xFF00FFFFu, 0x00FFFFFFu, 0xFFFFFFFFu,
+};
+
 // Decode the 256x192 Spectrum bitmap + attribute VRAM into the
 // template's chunked framebuffer, one palette-index byte per pixel,
-// centred at (ZX_FB_X0, ZX_FB_Y0). The surrounding margin is cleared
-// to the current border colour. Runs every VBL; the m68k blits the
-// result to the ST screen. Unlike upstream there is no scaling or
-// partial-update: the whole 320x200 buffer is rewritten each frame.
+// centred at (ZX_FB_X0, ZX_FB_Y0). The surrounding margin is the
+// border colour. Runs every VBL; the m68k blits the result to the ST.
+//
+// Incremental: only rows flagged in EMU.dirty_vram (maintained by the
+// mem.h write hooks) are re-decoded, and the border/canvas is cleared
+// only when the border colour changes -- callers that bypass the write
+// hooks (menu overlay, snapshot loads, FLASH blink) must call
+// vram_force_dirty() first. Each attribute cell is written as two
+// 32-bit stores via zx_nib_mask (fb_chunked_buffer is 4-byte aligned
+// and ZX_FB_X0 / FB_CHUNKED_W keep every row start aligned).
+#pragma GCC push_options
+#pragma GCC optimize("O2")
 void __not_in_flash_func(update_display)(void) {
     const uint8_t *vmem = EMU.zx.ram[EMU.zx.display_ram_bank];
     const uint8_t border = EMU.show_border ? EMU.zx.border_color : 0;
 
-    // Clear the whole framebuffer to the border colour; the decode
-    // below overwrites the central 256x192 window.
-    fb_chunked_clear(border);
+    // Border changed (or vram_force_dirty's 0xff sentinel): repaint the
+    // whole canvas; the row loop below then rebuilds the bitmap area.
+    bool full = false;
+    if (border != EMU.last_update_border_color) {
+        fb_chunked_clear(border);
+        EMU.last_update_border_color = border;
+        full = true;
+    }
 
     for (int py = 0; py < 192; py++) {
+        if (!full && !(EMU.dirty_vram[py >> 3] & (1u << (py & 7)))) continue;
         const uint8_t *row = vmem +
             (((py & 0xC0) << 5) | ((py & 0x07) << 8) | ((py & 0x38) << 2));
         const uint8_t *attrrow = vmem + 0x1800 + ((py >> 3) << 5);
-        uint8_t *dst = fb_chunked_buffer +
-            (ZX_FB_Y0 + py) * FB_CHUNKED_W + ZX_FB_X0;
+        uint32_t *dst = (uint32_t *)(fb_chunked_buffer +
+            (ZX_FB_Y0 + py) * FB_CHUNKED_W + ZX_FB_X0);
 
         for (int bx = 0; bx < 32; bx++) {
             uint8_t bits = row[bx];
@@ -634,13 +696,18 @@ void __not_in_flash_func(update_display)(void) {
             if ((attr & 0x80) && zx_blink_phase) {  // FLASH: swap ink/paper
                 uint8_t t = ink; ink = paper; paper = t;
             }
-            for (int b = 0; b < 8; b++) {
-                *dst++ = (bits & 0x80) ? ink : paper;
-                bits <<= 1;
-            }
+            const uint32_t inkw = ink * 0x01010101u;
+            const uint32_t paperw = paper * 0x01010101u;
+            const uint32_t mhi = zx_nib_mask[bits >> 4];
+            const uint32_t mlo = zx_nib_mask[bits & 15u];
+            *dst++ = (inkw & mhi) | (paperw & ~mhi);
+            *dst++ = (inkw & mlo) | (paperw & ~mlo);
         }
     }
+
+    vram_reset_dirty();
 }
+#pragma GCC pop_options
 
 // Clear all keys. Useful when we switch game, to make sure that no
 // key downs are left from a previous game.
@@ -777,10 +844,9 @@ int populate_games_list(void) {
 // PWM / overclock setup, which the template owns.
 void init_emulator(void) {
     EMU.debug = 0;
+    vram_force_dirty();  // first decode is a full pass over the boot frame
     EMU.menu_active = 1;
     EMU.about_active = 0;
-    EMU.base_clock = 225000;   // Informational only (settings menu).
-    EMU.emu_clock = 225000;
     EMU.tick = 0;
     EMU.cursor_as_keys = 0;    // cursor keys default to Kempston joystick
     EMU.selected_game = 0;
@@ -806,6 +872,7 @@ void init_emulator(void) {
     zx_desc.joystick_type = ZX_JOYSTICKTYPE_KEMPSTON;
     zx_desc.roms.zx48k.ptr = (void *)dump_amstrad_zx48k_bin;
     zx_desc.roms.zx48k.size = sizeof(dump_amstrad_zx48k_bin);
+    zx_desc.audiobuf = zx_audiobuf_store;
     zx_init(&EMU.zx, &zx_desc);
     EMU.zx.scanline_period = ZX_DEFAULT_SCANLINE_PERIOD;
 
@@ -850,6 +917,8 @@ void load_game(int game_id) {
         zx_quickload(&EMU.zx, r);
 
     EMU.loaded_game = game_id;
+    vram_force_dirty();  // snapshot rewrote VRAM behind the mem.h hooks,
+                         // and the load borrowed fb_chunked_buffer
 }
 
 /* ============================ Public entry points ========================= */
@@ -985,11 +1054,40 @@ void zxemu_render_frame(void) {
     }
     prev_joy = joy;
 
-    // Run the Spectrum for one frame's worth of ticks.
-    zx_exec(&EMU.zx, FRAME_USEC);
+    // Run the Spectrum for exactly one emulated frame, timed so the About
+    // pop-over can report how much of the 20 ms PAL VBL budget the
+    // emulation is eating. Accumulators (acc_*) sum over a ~1 s window,
+    // then publish per-frame means into the EMU.perf_* fields About
+    // reads. (The first window spans boot to first rollover -- its fps
+    // reads slightly low once, which isn't worth a special case.)
+    static uint32_t acc_win_us = 0, acc_exec_us = 0, acc_frames = 0;
+    static uint32_t acc_disp_us = 0, acc_pub_us = 0;
+    const uint32_t t0 = time_us_32();
+    zx_exec(&EMU.zx, zx_frame_usec());
+    const uint32_t t1 = time_us_32();
+    acc_exec_us += t1 - t0;
+    acc_frames++;
+    if (t1 - acc_win_us >= 1000000u) {
+        const uint32_t span = t1 - acc_win_us;
+        EMU.perf_exec_us = acc_exec_us / acc_frames;
+        EMU.perf_disp_us = acc_disp_us / acc_frames;
+        EMU.perf_pub_us = acc_pub_us / acc_frames;
+        EMU.perf_fps_x10 =
+            (uint32_t)(((uint64_t)acc_frames * 10000000u) / span);
+        DPRINTF("emu %u disp %u pub %u us/frame, %u.%u fps\n",
+                EMU.perf_exec_us, EMU.perf_disp_us, EMU.perf_pub_us,
+                EMU.perf_fps_x10 / 10u, EMU.perf_fps_x10 % 10u);
+        acc_win_us = t1;
+        acc_exec_us = 0;
+        acc_disp_us = 0;
+        acc_pub_us = 0;
+        acc_frames = 0;
+    }
 
-    // Toggle the FLASH phase ~twice per second (every 16 frames).
-    if ((EMU.tick & 0x0f) == 0) zx_blink_phase ^= 1u;
+    // Toggle the FLASH phase ~twice per second (every 16 frames). The
+    // decode is dirty-row incremental, so force a full pass to repaint
+    // every FLASH cell.
+    if ((EMU.tick & 0x0f) == 0) { zx_blink_phase ^= 1u; vram_force_dirty(); }
 
     // Draw the menu, or the About pop-over on top of it (the pop-over
     // replaces the menu so nothing peeks out beside it). Both draw into the
@@ -999,19 +1097,30 @@ void zxemu_render_frame(void) {
     // repaint the overwritten cells, leaving artifacts after dismissal).
     uint8_t *vram = EMU.zx.ram[EMU.zx.display_ram_bank];
     const bool overlay = EMU.about_active || EMU.menu_active;
+    const uint32_t td0 = time_us_32();
     if (overlay) {
         memcpy(s_vram_save, vram, ZX_VRAM_SIZE);
         if (EMU.about_active) ui_draw_about();
         else                  ui_draw_menu();
+        vram_force_dirty();   // overlay drew into VRAM behind the hooks
     }
 
     // Decode VRAM into the framebuffer and hand off to the ST (blocks
     // on the VBL, pacing this loop to 50 Hz).
     update_display();
 
-    if (overlay) memcpy(vram, s_vram_save, ZX_VRAM_SIZE);  // undo the overlay
+    if (overlay) {
+        memcpy(vram, s_vram_save, ZX_VRAM_SIZE);  // undo the overlay
+        vram_force_dirty();  // next frame must repaint what it covered
+    }
+    const uint32_t td1 = time_us_32();
+    acc_disp_us += td1 - td0;
 
+    // Deliberately timed from outside (unlike fb_last_convert_us(),
+    // which is transpose+copy only): "pub" includes the VBL wait, so an
+    // unexpected stall in the pacing shows up here instead of hiding.
     fb_publish();
+    acc_pub_us += time_us_32() - td1;
 
     EMU.tick++;
 }

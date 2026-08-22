@@ -8,20 +8,25 @@
 
 #include "commemul.h"
 
+#include "cart_shared.h"
 #include "commemul.pio.h"
 #include "constants.h"
 #include "debug.h"
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 
-#define COMM_RING_BITS 12u  /* md-speccy: ROM3 carries only IKBD bytes (<1/ms), drained sub-ms; 32K->4K to fit the emulator */
+#define COMM_RING_BITS 10u  /* md-speccy: ROM3 carries only IKBD bytes plus one VBL ack per frame -- a handful of entries per drain, so 512 slots is ~50x headroom. 32K->4K->1K to fit the RAM-resident Z80 decoder + the heap the boot-time settings library needs. */
 #define COMM_RING_SIZE_BYTES (1ul << COMM_RING_BITS)
 #define COMM_RING_WORDS (COMM_RING_SIZE_BYTES / sizeof(uint16_t))
 #define COMM_RING_MASK (COMM_RING_WORDS - 1u)
 #define COMM_DMA_TRANSFER_COUNT (0xFFFFFFFFu)
 
+/* md-speccy: parked in the cartridge-region hole. The DMA ring wrap
+   still needs natural alignment, which the linker script guarantees by
+   placing the ring first in the section. */
 static uint16_t commRing[COMM_RING_WORDS]
-    __attribute__((aligned(COMM_RING_SIZE_BYTES)));
+    __attribute__((aligned(COMM_RING_SIZE_BYTES)))
+    __cart_app_free("commring");
 static uint32_t commReadIdx = 0;
 static int commDmaChannel = -1;
 static int commSm = -1;

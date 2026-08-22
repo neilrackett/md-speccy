@@ -30,6 +30,15 @@ MEMORY
 /*    FLASH(rx) : ORIGIN = 0x10000000, LENGTH = 1152k  The first 1152kb available */
     RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 192k  /* Reclaim the upper 64KB as general RAM */
     ROM_IN_RAM (rwx) : ORIGIN = 0x20030000, LENGTH = 64K
+    /* md-speccy: the shared cartridge region has a hole between
+       CART_APP_FREE_OFFSET ($4500) and CART_FRAMEBUFFER_OFFSET ($8300) --
+       15,872 bytes of ordinary SRAM that neither the ST nor the template
+       ever reads (this region starts 768 B in, on an alignment boundary
+       generous enough for the DMA ring placed first in the section). App buffers that don't have to live in RAM are parked
+       here so RAM can hold the Z80 decoder. Deliberately overlaps
+       ROM_IN_RAM, whose section is empty; keep both offsets in sync with
+       rp/src/include/cart_shared.h. */
+    CART_APP_FREE (rw) : ORIGIN = 0x20034800, LENGTH = 0x3B00
     SCRATCH_X(rwx) : ORIGIN = 0x20040000, LENGTH = 4k
     SCRATCH_Y(rwx) : ORIGIN = 0x20041000, LENGTH = 4k
     BOOSTER_APP_FLASH(r) : ORIGIN = 0x10120000, LENGTH = 768K /* Size of the flash for the booster app */ 
@@ -213,6 +222,28 @@ SECTIONS
         __rom_in_ram_end__ = .;
     } > ROM_IN_RAM AT > FLASH
     __rom_in_ram_source__ = LOADADDR(.rom_in_ram);
+
+    /* md-speccy: buffers exiled to the cartridge-region hole (see
+       CART_APP_FREE above). NOLOAD because nothing here needs zero-init --
+       emul_start()'s ERASE_FIRMWARE_IN_RAM() wipes the whole 64 KB shared
+       region before any of it is touched. The DMA ring comes first and the
+       region starts on a 2 KB boundary, so the ring's natural-alignment
+       requirement costs no padding (an output section inherits its widest
+       input alignment, which would otherwise push the whole block up).
+       Overflow is caught at link time by the region length. */
+    .cart_app_free (NOLOAD) : {
+        __cart_app_free_start__ = .;
+        *(.cart_app_free.commring)
+        *(.cart_app_free.*)
+        . = ALIGN(4);
+        __cart_app_free_end__ = .;
+    } > CART_APP_FREE
+    /* A naturally-aligned buffer that no longer fits first would drag
+       the whole section above ORIGIN and silently waste an alignment
+       unit -- fail the link instead. (emul_start() additionally checks
+       the section against cart_shared.h's authoritative offsets.) */
+    ASSERT(ADDR(.cart_app_free) == ORIGIN(CART_APP_FREE),
+           ".cart_app_free dragged off ORIGIN by input alignment")
 
     .bss  : {
         . = ALIGN(4);

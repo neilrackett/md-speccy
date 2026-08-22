@@ -52,7 +52,8 @@ static uint32_t s_vbl_published;
 #define DEMO_SPRITE_H 16
 #define DEMO_SPRITE_KEY 0xFFu
 
-static uint8_t demo_sprite_data[DEMO_SPRITE_W * DEMO_SPRITE_H];
+static uint8_t demo_sprite_data[DEMO_SPRITE_W * DEMO_SPRITE_H]
+    __cart_app_free("demo_sprite");  /* built at fb_init() */
 static const struct FB_BITMAP demo_sprite = {
     DEMO_SPRITE_W, DEMO_SPRITE_H, demo_sprite_data};
 

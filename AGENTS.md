@@ -289,15 +289,29 @@ the c2p worker.**
 
 ### Display decode (validated offline)
 
-`update_display()` (in `zxemu.c`, `__not_in_flash_func`): clears the FB
-to the border colour, then for each of 192 rows reads the Spectrum
-bitmap byte at `((py&0xC0)<<5)|((py&0x07)<<8)|((py&0x38)<<2)|(px>>3)` and
-attribute at `0x1800+((py>>3)<<5)+(px>>3)`, applies BRIGHT
-(`(attr&0x40)>>3` → +8 to the index) and FLASH (swap ink/paper when the
-frame counter's blink phase is set), and writes the palette index to
-`fb_chunked_buffer[(4+py)*320 + 32 + x]`. The 16 ZX colours are pushed to
-the ST shifter palette in `zx_set_palette()` (`zxpalette` is `0x00BBGGRR`
-→ `PALETTE_RGB` 3-bit channels).
+`update_display()` (in `zxemu.c`, `__not_in_flash_func`, `-O2` region) is
+**dirty-row incremental**: the `mem.h` write hooks maintain a per-row
+bitmap (`EMU.dirty_vram`, one bit per scanline; attribute writes mark all
+8 covered rows) and only flagged rows are re-decoded; the border/canvas
+is cleared only when the border colour changes
+(`EMU.last_update_border_color`, `0xff` = forced). **Anything that
+touches VRAM or the framebuffer behind the hooks must call
+`vram_force_dirty()` first** — current callers: the FLASH blink toggle,
+the menu/About overlay draw *and* its restore, `load_game()` (snapshots
+write VRAM directly and borrow `fb_chunked_buffer`), and
+`init_emulator()`. Missing one shows up as stale screen regions.
+
+Per row it reads the Spectrum bitmap byte at
+`((py&0xC0)<<5)|((py&0x07)<<8)|((py&0x38)<<2)|(px>>3)` and attribute at
+`0x1800+((py>>3)<<5)+(px>>3)`, applies BRIGHT (`(attr&0x40)>>3` → +8)
+and FLASH (swap ink/paper on blink phase), and writes each 8-pixel cell
+as **two 32-bit stores** through the `zx_nib_mask[16]` nibble→byte-lane
+table (`(inkw & m) | (paperw & ~m)`) into
+`fb_chunked_buffer[(4+py)*320 + 32 ...]` — byte-for-byte identical to
+the old per-pixel loop (validated offline over every bits/attr/blink
+combination). The 16 ZX colours are pushed to the ST shifter palette in
+`zx_set_palette()` (`zxpalette` is `0x00BBGGRR` → `PALETTE_RGB` 3-bit
+channels).
 
 ### Input (direct ST→Spectrum mapping — replaced the keymap system)
 
@@ -342,9 +356,14 @@ play.
 
 ### Joystick ingest (always on, hardware-confirmed)
 
-`ikbd.c` runs a small state machine consuming `$FE/$FF` (one stick) /
-`$FD` (both) packets into `s_joy_state` (bit0 up,1 down,2 left,3 right,7
-fire), exposed via `ikbd_get_joystick()`; `zxemu_render_frame` folds those
+`ikbd.c` runs a small state machine consuming `$FE` (joystick 0) / `$FF`
+(joystick 1) / `$FD` (both, 0 then 1) packets into per-port
+`s_joy_state[2]` (bit0 up,1 down,2 left,3 right,7 fire; masked to
+`$8F`), with `ikbd_get_joystick()` reporting **port 1 only** — with
+event reporting on (`$14`) the port-0 mouse reports as joystick 0, and a
+stationary mouse's quadrature lines latch a steady non-zero byte that
+would otherwise clobber the real stick (games polling Kempston for a
+clear port then never start); `zxemu_render_frame` folds those
 bits into the Kempston mask (in play) or into menu navigation (in menu).
 The m68k side is the interrupt-driven ACIA handler in the IKBD pipeline
 above (`userfw_acia_irq` + `$12`/`$14` sends). This is what made it
@@ -399,20 +418,68 @@ file any more — input is the direct mapping described above.)
 
 ### RAM budget — CRITICAL, read before adding statics
 
-The 48 KB Spectrum RAM (`zx_t.ram[3][0x4000]`) is irreducible, so the
-port only just fits the 192 KB region (links with ~15 KB heap headroom).
-`.bss`+heap must not cross `0x20030000`. If you overflow `RAM`, the
-reclaims that made it fit were:
+The 48 KB Spectrum RAM (`zx_t.ram[3][0x4000]`) is irreducible, and the
+22 KB Z80 decoder is pinned into RAM as well, so the port only just fits
+the 192 KB region. `.bss`+heap must not cross `0x20030000`.
+
+**The heap floor is ~10.5 KB — an overflow here does NOT fail the link.**
+The boot-time settings library mallocs a **4 KB buffer each for gconfig
+and aconfig (held forever)** plus a ~4.2 KB transient per init
+(`settings_init`, entries copy), peaking at ~8.4 KB *before `emul_start`
+even runs*; FatFs (LFN=3 + exFAT) adds ~2.2 KB of transient per
+open-file/dir on top of the 8.2 KB held, so runtime peaks at ~10.5 KB.
+If a boot-time malloc fails, `gconfig_init`/`aconfig_init` fail and
+`main.c` **jumps to Booster** — the symptom is "app launches then lands
+straight back in Booster", which looks like a crash but is a deliberate
+bail. Check heap after every RAM change: `0x20030000 - __bss_end__` in
+the `.map` (currently ~11.6 KB release / ~11.3 KB debug).
+
+**Byte arithmetic is not enough**: newlib's full malloc grows the heap
+in **page-rounded (4 KB) sbrk steps**, so without countermeasures a
+malloc can fail on the rounding excursion while the actual bytes fit —
+the settings sequence needs a ~12.5 KB window that way, and diagnosing
+it from the `.map` shows a seemingly-sufficient heap. The build sets
+`PICO_USE_OPTIMISTIC_SBRK=1` (rp/src/CMakeLists.txt) so an over-limit
+sbrk grant is clamped to `__StackLimit` instead of failing; newlib's
+dlmalloc re-queries the actual break after each grant (verified in the
+disassembly), so the clamp is safe and the whole window is usable. Do
+not remove that define — every build maps back to Booster without it.
+
+If you overflow `RAM` (or the heap floor), the reclaims that made it
+fit were:
 
 1. **ZX ROM `const`** — `zx-roms.h` arrays were `unsigned char` (→ 16 KB
    in `.data` RAM!); made `const` → flash. Keep them const.
 2. **ROM mapped from flash** — `zx.h` `zx_t.rom[1][0x4000]` (a 16 KB RAM
    copy) replaced with a `const uint8_t* rom0` pointer into the flash
    array. `MODIFIED (md-speccy)`.
-3. **ROM3 ring 32 KB→4 KB** — `commemul.c COMM_RING_BITS` 15→12.
-4. Dropped a 50 KB `static zx_t im` from the unused `zx_load_snapshot`
+3. **ROM3 ring 32 KB→4 KB→2 KB** — `commemul.c COMM_RING_BITS` 15→12→11.
+4. **The cartridge-region hole** — the shared 64 KB region has 15,872
+   unused bytes between `CART_APP_FREE_OFFSET` (`$4500`) and
+   `CART_FRAMEBUFFER_OFFSET` (`$8300`) — verified unused: the m68k
+   defines `APP_FREE_ADDR` but never references it, and every RP-side
+   cart writer stays outside it. It is ordinary SRAM, so `memmap_rp.ld`
+   maps a `CART_APP_FREE` region over it and a `.cart_app_free` output
+   section parks `commRing` (1 KB), `GamesTable` (2.25 KB),
+   `s_vram_save` (6.75 KB), the `zx_t` audio ring (1 KB, now a pointer —
+   `MODIFIED` in `zx.h`), both `mem.h` dummy pages (2 KB, `MODIFIED`)
+   and the demo sprite (256 B) there — **~13 KB reclaimed from `RAM`**,
+   ~1.5 KB still free. Tag a buffer into it with
+   `__attribute__((section(".cart_app_free.<name>")))`.
+   Constraints: the section is `NOLOAD`, so nothing there is zero-inited
+   by the CRT — only park buffers first touched **after** `emul_start()`
+   wipes the region (`ERASE_FIRMWARE_IN_RAM()`), and never anything a
+   pre-`main` consumer (newlib, settings, stdio) relies on being zeroed.
+   The DMA ring must come first: an output section inherits its widest
+   input alignment, so a naturally-aligned buffer placed later drags the
+   whole block up and wastes a full alignment unit. The region starts at
+   `$4800`, not `$4500`, for the same reason. Overflow is caught at link
+   time by the region length.
+5. **ROM3 ring 4 KB→1 KB** (on top of reclaim 3) and
+   **`ZX_MAX_GAMES` 128→64** — both sized generously vs. actual use.
+6. Dropped a 50 KB `static zx_t im` from the unused `zx_load_snapshot`
    (it was already `--gc-sections`'d away, so this was cosmetic — the
-   real wins were 1–3).
+   real wins were 1–5).
 
 Diagnose overflow with the linker `.map` (`rp/build-*/rp.elf.map`), not
 by estimating: `--gc-sections` drops unused statics, and non-`const`
@@ -421,14 +488,75 @@ the totals. A host `sizeof` probe over `rp/src/zx/*.h` (define
 `SPEAKER_PIN`, stub `vram_set_dirty_*`) gives struct sizes; `zx_t` is
 ~56.7 KB.
 
-### Speed (deferred)
+### Frame pacing
 
-Runs at the template's 225 MHz; the emulator stays in flash (XIP) and
-shares Core 0 with the cart bus, so it may run slow. Not yet optimised —
-the owner asked to get it working first. Levers if needed: `#pragma GCC
-optimize("O3")` on `zxemu.c`, `__not_in_flash_func` on the emulator hot
-path (needs `zx.h`/`z80.h` edits), higher clock/voltage (must re-tune the
-PIO cart-bus timing — risky).
+`zx_exec()` runs *at least* the requested ticks and then keeps going until
+the raster reaches the end of the bitmap (scanline 256), so what a call
+actually costs is set by that exit, not by the microseconds asked for.
+`zx_frame_usec()` in `zxemu.c` requests 200 scanlines' worth — comfortably
+inside the `(1, 256)` scanline window for every `scanline_period` the
+`scan-p` menu item allows — so **one call advances exactly one emulated
+frame**, matching the 50 Hz VBL that `fb_publish()` already paces us to.
+
+Upstream's flat `FRAME_USEC` of 25000 µs overshot the first frame's
+scanline 256 and ran on to the second: two emulated frames of work per
+displayed frame, i.e. 4.70 M ticks/s needed for full speed instead of
+2.35 M. That suited zx2040's SPI panel, which redrew far below 50 Hz.
+Don't reintroduce a fixed µs figure here. Validated offline by mirroring
+the `zx_exec` loop and `_zx_tick`'s raster logic over `scanline_period`
+10..500.
+
+### Speed
+
+Runs at the template's 225 MHz, sharing Core 0 with the cart bus.
+
+Measured at 225 MHz with `z80_tick` in flash: **39.5 ms per emulated
+frame = 1.19 M ticks/s = 51% of real time**, i.e. 189 CPU cycles per
+`z80_tick` call. An interpreter step should be 30–60, so the bulk of that
+was XIP stall — `z80_tick` is ~22 KB against a 16 KB XIP cache, so it
+missed on essentially every tick. Hence the `__not_in_flash_func` on it
+(`z80.h`, `MODIFIED (md-speccy)`) and the RAM reclaims above. Note this
+also means **overclocking alone could never have fixed it**: full speed
+needs 1.98x and 400 MHz offers at most 1.78x of core, diluted by a slower
+flash divider.
+
+**Measuring:** `zxemu_render_frame()` times `zx_exec()` and averages over
+a ~1 s window into `EMU.perf_exec_us` / `EMU.perf_fps_x10`. The About
+pop-over shows both (`emu 13.2ms  fps 50.0`), so a release build on
+hardware reports its own speed; debug builds also `DPRINTF` it each
+window. Under 20 ms of emulation per frame means full speed. The figures
+include the pop-over's own compositing cost, so they read slightly below
+the in-play rate.
+
+What was tried, and what the hardware measurements showed:
+
+1. **`z80_tick` out of XIP — done, and it bought nothing** (39.5 →
+   40.3 ms measured). The hot flash set was effectively cached all
+   along; the emulator is **CPU-bound**, not flash-bound. The pinning is
+   kept (it makes the hot path immune to the slower flash divider at
+   400 MHz) but don't expect residency changes to move the needle.
+2. **`-O2` on the per-tick path** (`z80_tick` in `z80.h`; `_zx_tick` +
+   `zx_exec` in `zx.h`, via `#pragma GCC push_options` regions — the
+   file default stays `-Os`). `-O2` `z80_tick` is slightly *smaller*
+   than `-Os` (22,124 B), so no RAM cost.
+3. **400 MHz / 1.30 V overclock** (`constants.h`), the only clock target
+   that wins: the SSI divisor must be even, so flash drops /2 → /4
+   (112.5 → 100 MHz; at 300 MHz sys, /4 = 75 MHz — slower than stock).
+   The divider is baked into boot_stage2 via a directory-property
+   definition in `rp/src/CMakeLists.txt` (verified in the bs2
+   disassembly: BAUDR = 4). The cart-bus PIO keeps its proven 225 MHz
+   wall-clock timing via `SAMPLE_DIV_FREQ = RP2040_CLOCK_FREQ_KHZ /
+   225000.f` (fractional-divider jitter ≤1 sysclk ≈ 2.5 ns against a
+   ~71 ns settle budget). `main.c` raises the voltage **before** the
+   clock (never run the higher frequency at the lower voltage, even
+   transiently). If a board can't do 400 MHz (silicon lottery), the
+   step-down ladder is in `constants.h`; remember /2 flash is only safe
+   at 225 MHz.
+
+Expected combined effect: 40.3 ms × ~0.85 (O2) ÷ 1.78 (clock) ≈ 19 ms —
+right at the 20 ms budget. If it lands short, the remaining ideas are
+per-game `scan-p` tuning (fewer emulated ticks/frame) and shaving
+`update_display`.
 
 ---
 

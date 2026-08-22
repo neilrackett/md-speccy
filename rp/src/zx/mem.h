@@ -214,10 +214,15 @@ void mem_snapshot_onload(mem_t* snapshot, void* base);
     #define CHIPS_ASSERT(c) assert(c)
 #endif
 
+/* MODIFIED (md-speccy port): both dummy pages parked in the
+   cartridge-region hole (safe there: the unmapped page is memset below,
+   the junk page is a write-only sink). */
 // a dummy page for currently unmapped memory
-static uint8_t _mem_unmapped_page[MEM_PAGE_SIZE];
+static uint8_t _mem_unmapped_page[MEM_PAGE_SIZE]
+    __cart_app_free("mem_unmapped");
 // a write-only 'junk table' for writes to ROM areas
-static uint8_t _mem_junk_page[MEM_PAGE_SIZE];
+static uint8_t _mem_junk_page[MEM_PAGE_SIZE]
+    __cart_app_free("mem_junk");
 
 void mem_init(mem_t* m) {
     CHIPS_ASSERT(m);

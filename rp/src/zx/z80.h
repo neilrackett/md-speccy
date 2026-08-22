@@ -1812,7 +1812,13 @@ uint64_t z80_prefetch(z80_t* cpu, uint16_t new_pc) {
 #define _cc_p           (!(cpu->f&Z80_SF))
 #define _cc_m           (cpu->f&Z80_SF)
 
-uint64_t z80_tick(z80_t* cpu, mem_t *mem, uint64_t pins) {
+/* MODIFIED (md-speccy port): compiled -O2 (the file default is -Os) --
+   the decoder is pure CPU-bound interpreter dispatch, measured on
+   hardware at ~189 cycles/tick under -Os with RAM vs flash residency
+   making no difference. */
+#pragma GCC push_options
+#pragma GCC optimize("O2")
+uint64_t __not_in_flash_func(z80_tick)(z80_t* cpu, mem_t *mem, uint64_t pins) {
 switch_again:
     pins &= ~(Z80_CTRL_PIN_MASK|Z80_RETI);
     #if 0
@@ -4821,6 +4827,7 @@ step_next_and_iterate: cpu->step += 1;
     }
     goto switch_again;
 }
+#pragma GCC pop_options  /* MODIFIED (md-speccy): end of -O2 region */
 
 #undef _sa
 #undef _sax

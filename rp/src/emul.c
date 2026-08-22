@@ -19,6 +19,7 @@
 
 #include "aconfig.h"
 #include "audio.h"
+#include "cart_shared.h"
 #include "commemul.h"
 #include "constants.h"
 #include "debug.h"
@@ -61,6 +62,20 @@ void emul_start() {
   SettingsConfigEntry *folder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
   const char *folderName = folder ? folder->value : "/speccy";
+
+  // The .cart_app_free buffers live inside the shared region's unused
+  // hole. The linker script hard-codes that window (ld cannot read C
+  // headers), so verify it here against cart_shared.h's authoritative
+  // offsets -- a drifted script would let the ST-visible layout and the
+  // parked buffers collide.
+  {
+    extern char __cart_app_free_start__[], __cart_app_free_end__[];
+    const char *base = (const char *)&__rom_in_ram_start__;
+    if (__cart_app_free_start__ < base + CART_APP_FREE_OFFSET ||
+        __cart_app_free_end__ > base + CART_FRAMEBUFFER_OFFSET) {
+      panic(".cart_app_free outside the shared-region hole");
+    }
+  }
 
   // Zero the whole 64 KB shared region so every byte the m68k can see is
   // deterministic, then copy the cartridge image into it.

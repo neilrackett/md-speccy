@@ -48,11 +48,23 @@
 #define ROM_SIZE_LONGWORDS (ROM_SIZE_BYTES / 4)       // 16KLongWords
 
 // Frequency constants.
-#define SAMPLE_DIV_FREQ (1.f)         // Sample frequency division factor.
-#define RP2040_CLOCK_FREQ_KHZ 225000  // Clock frequency in KHz (225MHz).
+// 400 MHz so the Spectrum emulator reaches full speed (measured ~2x too
+// slow at the template's 225 MHz). Requires 1.30 V and a /4 flash
+// divider (see PICO_FLASH_SPI_CLKDIV in CMakeLists.txt); the PIO
+// cart-bus programs keep their proven 225 MHz wall-clock timing via the
+// scaled divider below. If a board fails to boot at 400 MHz (silicon
+// lottery), step down: 360000 @ VREG_VOLTAGE_1_25, then 300000 @
+// VREG_VOLTAGE_1_15, then back to 225000 @ VREG_VOLTAGE_1_10 (a /2
+// flash divider is only safe at 225).
+#define RP2040_CLOCK_FREQ_KHZ 400000  // Clock frequency in KHz.
+// PIO clock divider: keeps the cart-bus PIO programs at their original
+// 225 MHz cycle timing regardless of the sysclk overclock. Fractional
+// divider jitter is <=1 sysclk (~2.5 ns) against a ~71 ns settle
+// budget -- negligible.
+#define SAMPLE_DIV_FREQ ((float)RP2040_CLOCK_FREQ_KHZ / 225000.0f)
 
 // Voltage constants.
-#define RP2040_VOLTAGE VREG_VOLTAGE_1_10  // Voltage in 1.10 Volts.
+#define RP2040_VOLTAGE VREG_VOLTAGE_1_30  // Required for 400 MHz.
 #define VOLTAGE_VALUES                                                 \
   (const char *[]){"NOT VALID", "NOT VALID", "NOT VALID", "NOT VALID", \
                    "NOT VALID", "NOT VALID", "0.85v",     "0.90v",     \
