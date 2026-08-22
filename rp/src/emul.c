@@ -106,9 +106,16 @@ void emul_start() {
   // Default palette; zxemu_init() overwrites it with the ZX palette.
   palette_init();
 
-  // Cart audio buffer producer. The beeper->YM fill callback is
-  // installed after the emulator core is up (it reads emulator state).
+  // Cart audio buffer producer. The beeper fill callback is installed
+  // after the emulator core is up (it reads emulator state).
   audio_init();
+
+  // Drive the refill from a 1 ms timer on Core 1 rather than the main
+  // loop: the m68k drains the cart buffer every VBL whatever the
+  // emulated frame costs, and a missed refill replays a stale buffer
+  // (audible as distortion). The Core 1 alarm pool binds the interrupt
+  // to Core 1 so it never preempts the emulator on Core 0.
+  audio_start_vbl_timer(1);
 
   // SD card -- best effort. Games live in `folderName`.
   FATFS fsys;
@@ -151,6 +158,6 @@ void emul_start() {
     }
 
     zxemu_render_frame();
-    audio_render_frame();
+    // No audio_render_frame() here: the Core 1 timer owns the refill.
   }
 }

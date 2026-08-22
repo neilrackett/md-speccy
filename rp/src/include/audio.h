@@ -49,6 +49,49 @@ extern "C" {
  * does not zero on entry.
  *
  * Called from the main loop at ~50 Hz; must not block. */
+
+/* Audio back-end, chosen at runtime from the m68k's _SND detection
+ * (reported over the cart bus, decoded in fb.c). Governs the per-VBL
+ * refill size and the format the fill callback produces. Defaults to
+ * SILENT until the first report arrives. */
+typedef enum {
+  AUDIO_MODE_SILENT = 0, /* zeros -- pre-report / no audio    */
+  AUDIO_MODE_YM,         /* 224 B/VBL: 112 (vA,vB) pairs      */
+  AUDIO_MODE_DMA         /* 500 B/VBL: 500 signed PCM samples */
+} audio_mode_t;
+
+/* Set the back-end (idempotent). Called by the cart-bus capability
+ * decoder; changes the refill size the fill callback is asked for. */
+void audio_set_mode(audio_mode_t mode);
+
+/* Current back-end, for the fill callback to pick its output format. */
+audio_mode_t audio_get_mode(void);
+
+/* Bytes the fill callback is asked for this VBL. In DMA mode this is
+ * steered by the m68k (see audio_set_fill_bytes); in YM mode it is
+ * fixed by the Timer-B divider. */
+uint32_t audio_get_fill_bytes(void);
+
+/* Set the DMA-mode refill size, as measured and reported by the m68k.
+ * Out-of-band values are ignored (it arrives over the cart bus).
+ * No-op in YM mode. */
+void audio_set_fill_bytes(uint32_t bytes);
+
+/* Decode one ROM3 cart-bus sample: the sound-capability report picks
+ * the back-end, the buffer-length report sets the refill size. Called
+ * from the ROM3 dispatcher. */
+void audio_consume_rom3_sample(uint16_t addr_lsb);
+
+/* Start the VBL-synced refill on `core` (0 or 1; 1 strongly preferred
+ * -- a Core 1 alarm pool binds the interrupt there, so the refill never
+ * interrupts the emulator). The handler peeks the ROM3 ring for the
+ * m68k's end-of-blit ack and fills right after it, so audio keeps its
+ * per-VBL cadence however long an emulated frame takes. Idempotent. */
+void audio_start_vbl_timer(int core);
+
+/* Stop the refill timer and silence the cart buffer. */
+void audio_stop_vbl_timer(void);
+
 typedef void (*audio_fill_cb_t)(uint8_t *buf, uint32_t bytes);
 
 /* Initialise the cart audio buffer pointer; clear any previously

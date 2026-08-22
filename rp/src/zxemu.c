@@ -1136,21 +1136,37 @@ static const uint8_t duty_att[33] = {
 
 void zxemu_audio_fill(uint8_t *buf, uint32_t bytes) {
     // The emulator samples the 1-bit beeper into zx.audiobuf during
-    // zx_exec(). Decimate the bits produced since the last fill down to
-    // the ~112 samples the m68k Timer-B handler consumes per VBL.
-    const uint32_t nsamp = bytes / 2;
+    // zx_exec(). Each per-VBL fill decimates the bits produced since
+    // the last one into whatever format the m68k-detected back-end
+    // consumes: 112 (vA,vB) YM volume pairs, or 500 signed 8-bit PCM
+    // samples for STE DMA sound (see audio_set_mode).
+    const audio_mode_t mode = audio_get_mode();
+    if (mode == AUDIO_MODE_SILENT) {
+        memset(buf, 0, bytes);
+        return;
+    }
+    const bool dma = (mode == AUDIO_MODE_DMA);
+    const uint32_t nsamp = dma ? bytes : bytes / 2;
     const uint32_t total = AUDIOBUF_LEN * 32;   // total beeper-sample bits
     static uint32_t rd = 0;                     // last consumed bit index
     uint32_t w = EMU.zx.audiobuf_byte * 32 + EMU.zx.audiobuf_bit;
     uint32_t avail = (w - rd) & (total - 1);
 
-    // Peak YM volume follows the menu volume setting (0..20 -> 0..15).
+    // Peak level follows the menu volume: 0..20 -> YM 0..15 / PCM 0..127.
     const uint8_t vmax = (uint8_t)((EMU.volume * 15u) / 20u);
+    const int32_t amp = (int32_t)((EMU.volume * 127u) / 20u);
 
     if (avail < nsamp) {
         // Too few fresh samples: hold the current beeper level (DC).
-        uint8_t v = EMU.zx.beeper_state ? vmax : 0;
-        for (uint32_t i = 0; i < nsamp; i++) { buf[2*i] = v; buf[2*i+1] = v; }
+        if (dma) {
+            const int8_t v = (int8_t)(EMU.zx.beeper_state ? amp : -amp);
+            memset(buf, (uint8_t)v, nsamp);
+        } else {
+            uint8_t v = EMU.zx.beeper_state ? vmax : 0;
+            for (uint32_t i = 0; i < nsamp; i++) {
+                buf[2*i] = v; buf[2*i+1] = v;
+            }
+        }
         return;
     }
 
@@ -1170,15 +1186,24 @@ void zxemu_audio_fill(uint8_t *buf, uint32_t bytes) {
                      >> (idx & 31)) & 1u;
             idx++;
         }
-        // Duty -> YM level via duty_att[]: the DAC is logarithmic, so a
-        // linear duty*vmax mapping companded the filtered edge samples
-        // into near-silence (undoing the low-pass and adding harmonics).
-        // Attenuating in log steps keeps amplitude proportional to duty.
-        const uint32_t q = (ones * 32u + n / 2u) / n;   // duty in 32nds
-        const uint8_t att = duty_att[q];
-        const uint8_t v = (att >= vmax) ? 0 : (uint8_t)(vmax - att);
-        buf[2*i] = v;
-        buf[2*i+1] = v;
+        if (dma) {
+            // Linear PCM: duty 0..n maps straight to -amp..+amp. No
+            // companding needed -- unlike the YM's log DAC below, the
+            // DMA sample value IS the amplitude.
+            buf[i] = (uint8_t)(int8_t)(((int32_t)(2u * ones) - (int32_t)n) *
+                                       amp / (int32_t)n);
+        } else {
+            // Duty -> YM level via duty_att[]: the DAC is logarithmic,
+            // so a linear duty*vmax mapping companded the filtered edge
+            // samples into near-silence (undoing the low-pass and adding
+            // harmonics). Attenuating in log steps keeps amplitude
+            // proportional to duty.
+            const uint32_t q = (ones * 32u + n / 2u) / n;   // duty in 32nds
+            const uint8_t att = duty_att[q];
+            const uint8_t v = (att >= vmax) ? 0 : (uint8_t)(vmax - att);
+            buf[2*i] = v;
+            buf[2*i+1] = v;
+        }
     }
     rd = w;
 }

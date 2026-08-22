@@ -187,13 +187,74 @@ VBL** — one call per loop paces the app to 50 Hz.
    VBL read (`fb_publish` blocks until that read), then the next
    iteration wipes it, so a later reset auto-boots MD/Speccy cleanly.
 
-### Audio pipeline (YM2149)
+### Audio pipeline (STE DMA with YM fallback)
 
-RP fills a 1 KB cart buffer at `$FA4100` with (vA, vB) volume pairs;
-m68k Timer-B (`/4`, TBDR=110 → ~5,585 Hz, ~112 fires/PAL VBL) writes both
-YM volume regs per fire. `userfw_vbl` resets the A0 read cursor to the
-buffer base every VBL (the resync edge). MD/Speccy installs its own fill
-callback (`audio_set_fill_callback`) — see port section.
+Two back-ends, both compiled into `userfw.s`, chosen at boot from the
+`_SND` cookie (bit 1 = DMA/PCM sound; design shared with md-mjpeg):
+
+- **STE DMA** — mono 8-bit signed PCM @ 25,033 Hz, loop-mode DMA over a
+  double buffer parked in the unused tails of the two screen pages
+  (`$77D00`/`$7FD00`, 512 B each — no extra ST RAM). Each VBL
+  `.after_copy` copies fresh bytes from the cart audio buffer into
+  whichever half the DMA isn't reading (bit 7 of `$FF890B`). Timer-B and
+  the YM stay untouched; the exit path stops the DMA and Timer-A before
+  returning to GEM. Two details are load-bearing (both learned on
+  hardware in md-doom — don't "simplify" either away):
+  - **START/END are written by `userfw_snd_irq`, never by the VBL
+    loop.** MFP Timer-A runs in event-count mode off the DMA's frame
+    end, so the handler re-points the loop at the buffer the chip just
+    left, a full frame before the next latch. From the VBL loop the six
+    byte writes sat at an arbitrary phase of the DMA frame; when the
+    chip's drift brought its frame end into that ~6 µs window it latched
+    START from one buffer and END from the other and played the 32 KB
+    between them — ~1.3 s of noise, every few minutes.
+  - **The buffer length is measured, not assumed.** The DMA and the
+    video run off different oscillators, so the chip eats ~501.5 bytes
+    per frame, not 500, and it varies by machine. `.after_copy` watches
+    the drift of the DMA's within-buffer offset (sampled every frame,
+    nudged ±1 every fourth so it can't hunt; jumps >64 are handovers and
+    ignored) and steers `UFW_SND_LEN` between `STE_SND_LEN_MIN/MAX`.
+    A fixed 500 runs the buffer dry about every 350 frames and replays
+    one — the ~7-second crackle. Validated offline: converges and stays
+    dry-free for chip rates 498.5–503.2.
+- **YM fallback** (plain ST / early TOS) — RP fills the 1 KB cart buffer
+  at `$FA4100` with (vA, vB) volume pairs; m68k Timer-B (`/4`, TBDR=110
+  → ~5,585 Hz, ~112 fires/PAL VBL) writes both YM volume regs per fire.
+  `userfw_vbl` resets the A0 read cursor to the buffer base every VBL.
+
+The m68k reports the detected capability every VBL via a cart read at
+`SNDCAP_WINDOW_BASE + has_dma` (`$FB8600/1`), and in DMA mode the
+measured length at `SNDLEN_WINDOW_BASE + len - STE_SND_LEN_MIN`
+(`$FB8C00`). `fb_rom3_dispatch` hands both to
+`audio_consume_rom3_sample()`, which owns the windows →
+`audio_set_mode()` / `audio_set_fill_bytes()` (`AUDIO_SNDLEN_BIAS` must
+match `STE_SND_LEN_MIN`; out-of-band lengths are ignored as bus noise).
+`AUDIO_MODE_SILENT` zeros until the first report. **The fill callback
+must produce however many bytes it is asked for** — that is what makes
+the steering inaudible, and `zxemu_audio_fill` does it by resampling
+onto the requested count.
+
+**The refill runs on a 1 ms timer on Core 1, not the main loop**
+(`audio_start_vbl_timer(1)` in `emul.c`; a Core 1 alarm pool binds the
+IRQ there). The handler peeks the ROM3 ring non-destructively
+(`commemul_scan`, its own cursor, so it steals nothing from the IKBD
+demux) for the m68k's end-of-blit ack at `$FB8400` and fills right
+after it — after the m68k copied the previous buffer, before it copies
+the next, so it can never tear under the copy. This decouples audio
+from frame rate: the m68k drains its buffer every 20 ms whatever an
+emulated frame costs, and when the main loop ran slower than the VBL it
+skipped fills and the m68k replayed a stale buffer (the distortion).
+Nothing on the emulator path calls `audio_render_frame()` any more.
+md-doom measured the same timer on **Core 0** stalling its renderer for
+100–200 ms every second or two (mechanism never identified), so keep it
+on Core 1. Safe here because md-speccy's only flash write is at boot,
+before the timer starts.
+`FORCE_NO_DMA=1` (m68k build flag) exercises the YM path on DMA
+hardware. **The MFP auto-EOI flip is deliberately common code before the
+audio branch** — unlike md-mjpeg (polled ACIA), our interrupt-driven
+IKBD handler needs auto-EOI in both modes; putting it in the YM-only
+block would wedge the keyboard on STE machines. MD/Speccy installs its
+own fill callback (`audio_set_fill_callback`) — see port section.
 
 ### Shared 64 KB cartridge region
 
@@ -219,9 +280,12 @@ hard-code. Key offsets: cartridge image (16 KB), `CMD_MAGIC_SENTINEL`
   VBL-synced hand-off. (`fb_render_frame` and the internal demo sprite
   are legacy and now only paint the boot frame; MD/Speccy overwrites it.)
 - `commemul.c` — ROM3 cart-bus capture ring. **The ring was shrunk from
-  32 KB to 4 KB** for MD/Speccy (`COMM_RING_BITS` 15→12) — it only carries
-  IKBD bytes (<1/ms, drained sub-ms), and the RAM was needed for the
-  emulator.
+  32 KB to 1 KB** for MD/Speccy (`COMM_RING_BITS` 15→10) — it only
+  carries IKBD bytes plus a few per-VBL report reads, and the RAM was
+  needed for the emulator. `commemul_poll()` consumes; `commemul_scan()`
+  peeks non-destructively with a caller-owned cursor, which is how the
+  audio refill interrupt watches for the VBL ack without stealing
+  samples from the IKBD demux.
 - `ikbd.c` / `ikbd.h` — IKBD ingest + demux; `ikbd_pop_key`. Gained a
   gated joystick packet parser + `ikbd_get_joystick()` for the port.
 - `romemul.*`, `sdcard.c`, `hw_config.c`, `gconfig.c`, `aconfig.c`,
@@ -284,7 +348,7 @@ the c2p worker.**
 | --- | --- |
 | ST77xx display driver | `update_display()` decodes 256×192 VRAM → `fb_chunked_buffer` at (32,4), one palette index/pixel, then `fb_publish()` |
 | GPIO buttons | `zxemu_handle_key()` applies ST keys directly via `zx_key_down/up`; the cursor cluster + ST joystick drive `zx_joystick()` (Kempston) |
-| PWM beeper on Core 1 | `zxemu_audio_fill` → YM (Core 1 freed for c2p) |
+| PWM beeper on Core 1 | `zxemu_audio_fill` → STE DMA PCM or YM (Core 1 freed for c2p) |
 | flash game blob | FatFs enum of `/speccy`, `.z80` via `zx_quickload`, `.sna` via `zx_quickload_sna` |
 
 ### Display decode (validated offline)
@@ -383,22 +447,36 @@ it back to the menu.
 
 ### Audio
 
-`zxemu_audio_fill(buf, bytes)` decimates the beeper. The emulator samples
-the 1-bit beeper into `zx.audiobuf` during `zx_exec` (enabled because
-`SPEAKER_PIN != -1`; one bit per 16 ticks into a 256×32-bit ring). Each
-per-VBL fill box-filters the ~5.5 K bits since the last fill into 112
-output windows whose bounds tile the span exactly (Bresenham — a fixed
+`zxemu_audio_fill(buf, bytes)` decimates the beeper into whichever
+format `audio_get_mode()` reports. The emulator samples the 1-bit beeper
+into `zx.audiobuf` during `zx_exec` (enabled because `SPEAKER_PIN !=
+-1`; one bit per 16 ticks into a 256×32-bit ring ≈ 218.75 kHz). Each
+per-VBL fill box-filters the ~5.5 K bits since the last fill into output
+windows whose bounds tile the span exactly (Bresenham — a fixed
 `avail/nsamp` step used to drop the division remainder, ~0.4 ms of
-timeline per fill, phase-jumping every sustained tone at 50 Hz), then
-maps each window's duty cycle through `duty_att[]` (round(−2·log₂ duty)
-YM steps below the menu-volume peak) so linear amplitude tracks duty on
-the YM's ~3 dB/step logarithmic DAC — a plain `duty*vmax` companded the
-filtered edges into near-silence. Same level on both channels. Template
-side, the refill gate `AUDIO_FRAME_PERIOD_US` (audio.c) is 15 ms: at
-20 ms it raced the ~20.03 ms ST PAL VBL, and a lost race skipped a fill,
-replaying a stale buffer for a frame while the producer overran the ring
-(the old intermittent distortion). Approximate ("recognisable, not
-hi-fi").
+timeline per fill, phase-jumping every sustained tone at 50 Hz). In
+**DMA mode** each window's duty maps linearly to a signed sample
+(−amp..+amp, amp from the menu volume) — no companding, the PCM value
+IS the amplitude. In **YM mode** duty goes through `duty_att[]`
+(round(−2·log₂ duty) YM steps below the menu-volume peak) so linear
+amplitude tracks duty on the YM's ~3 dB/step logarithmic DAC — a plain
+`duty*vmax` companded the filtered edges into near-silence. Same level
+on both YM channels. The
+number of output windows is whatever the m68k asked for that VBL, which
+is what lets the DMA length steering work; don't hard-code it.
+(`AUDIO_FRAME_PERIOD_US` / `audio_render_frame()` are now only the
+fallback path for apps that still pump audio from their main loop —
+md-speccy uses the Core 1 timer instead.) The result is approximate on
+YM ("recognisable, not hi-fi") and considerably cleaner on STE DMA,
+where 25 kHz linear PCM resolves the beeper's square edges ~4.5x finer
+than the 5.6 kHz log-DAC path.
+
+**The fill runs in a Core 1 interrupt while `zx_exec` produces on
+Core 0.** It reads `audiobuf_byte` then `audiobuf_bit`, in that order,
+which is what keeps it safe without a lock: the producer only moves
+forward, so a torn read yields a write index at or behind the true one,
+never ahead — `avail` can't wrap negative. Keep that order if you touch
+it.
 
 ### SD games
 
@@ -422,17 +500,21 @@ The 48 KB Spectrum RAM (`zx_t.ram[3][0x4000]`) is irreducible, and the
 22 KB Z80 decoder is pinned into RAM as well, so the port only just fits
 the 192 KB region. `.bss`+heap must not cross `0x20030000`.
 
-**The heap floor is ~10.5 KB — an overflow here does NOT fail the link.**
+**The heap floor is ~9.5 KB — an overflow here does NOT fail the link.**
 The boot-time settings library mallocs a **4 KB buffer each for gconfig
 and aconfig (held forever)** plus a ~4.2 KB transient per init
 (`settings_init`, entries copy), peaking at ~8.4 KB *before `emul_start`
-even runs*; FatFs (LFN=3 + exFAT) adds ~2.2 KB of transient per
-open-file/dir on top of the 8.2 KB held, so runtime peaks at ~10.5 KB.
+even runs*. On top of the 8.2 KB held, FatFs (LFN=3 + exFAT) adds
+~1.1 KB per open file/dir — one context at a time, because
+`populate_games_list` closes its dir before the builtin seeding opens a
+file — and the Core 1 audio alarm pool ~56 B, so runtime peaks at
+~9.4 KB. (Nest a `f_open` inside an open dir and that becomes ~10.5 KB.)
 If a boot-time malloc fails, `gconfig_init`/`aconfig_init` fail and
 `main.c` **jumps to Booster** — the symptom is "app launches then lands
 straight back in Booster", which looks like a crash but is a deliberate
 bail. Check heap after every RAM change: `0x20030000 - __bss_end__` in
-the `.map` (currently ~11.6 KB release / ~11.3 KB debug).
+the `.map` (currently ~10.8 KB release / ~10.5 KB debug, i.e. ~1.1-1.4 KB
+of margin — thin, so weigh any new RAM-resident code against it).
 
 **Byte arithmetic is not enough**: newlib's full malloc grows the heap
 in **page-rounded (4 KB) sbrk steps**, so without countermeasures a
