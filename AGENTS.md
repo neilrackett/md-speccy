@@ -113,10 +113,28 @@ was dropped when input moved to a direct ST→Spectrum keyboard mapping.)
   ```
 
 ### CI / release
-- `.github/workflows/build.yml` builds `pico_w` on PR (the trigger is
-  commented out locally — check before relying on it).
-- `.github/workflows/release.yml` runs on `v*` tags: builds, attaches
-  UF2 + JSON to the Release, uploads to `s3://atarist.sidecartridge.com/`.
+Both workflows are ports of md-doom's and are **live** (the old ones had
+their triggers commented out, so nothing ran automatically).
+- `.github/workflows/pr.yml` — on PRs to `main`, runs the same bare
+  `make` the release does, so a PR that would break the release fails
+  here. Tags nothing, publishes nothing, keeps no artifacts. Read-only
+  token; no UUID secret, so it works from forks and builds under the
+  sample UUID.
+- `.github/workflows/release.yml` — **rolling release on every push to
+  `main`** (not `v*` tags any more): builds, tags `version.txt`, moves
+  the lightweight `latest` tag, and clobbers the two assets on the
+  existing `latest` GitHub Release (title and body untouched). The app
+  UUID comes from the `APP_UUID_KEY` secret.
+
+The workflows these replaced came from the upstream template and
+published to SidecarTridge's own infrastructure; the S3 upload to
+`s3://atarist.sidecartridge.com/` went with them deliberately. Releases
+are also no longer versioned GitHub Releases with a CHANGELOG body —
+there is one `latest` release whose binaries are replaced. Both
+workflows track the *latest* atarist-toolkit-docker
+installer rather than pinning v1.3.0, because the pinned one derived the
+Docker image tag from the ambient `$VERSION` that `build.sh` exports and
+so looked for an image named after the app's own version.
 
 ### Tests / verification
 No test suite. Verification is: **build succeeds** (both targets),
