@@ -106,6 +106,11 @@ typedef struct {
         // ZX Spectrum 48K
         chips_range_t zx48k;
     } roms;
+    /* MODIFIED (md-speccy port): caller-provided storage for the 1-bit
+       beeper sample ring (AUDIOBUF_LEN uint32_t words), injected like
+       the ROM so the buffer can live outside the tight 192 KB RAM
+       region. */
+    uint32_t* audiobuf;
 } zx_desc_t;
 
 // ZX emulator state
@@ -132,7 +137,9 @@ typedef struct {
     // 1 bit, even if at high resolution.
 #define AUDIOBUF_LEN 256 // Must be power of 2
     int beeper_state;           // Last value written to the speaker bit.
-    uint32_t audiobuf[AUDIOBUF_LEN];    // 1 bit samples audio buffer.
+    /* MODIFIED (md-speccy port): the 1 KB sample ring was an in-struct
+       array; now a pointer to caller-provided storage (zx_desc_t). */
+    uint32_t* audiobuf;                 // 1 bit samples audio buffer.
     uint32_t audiobuf_byte;             // Current byte to write.
     uint32_t audiobuf_bit;              // Current bit to write.
     volatile uint32_t audiobuf_notify;  // Just a brutal inter-process signal.
@@ -223,7 +230,9 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     _zx_init_keyboard_matrix(sys);
 
     // Audio initialization
-    memset(sys->audiobuf,0,sizeof(sys->audiobuf));
+    sys->audiobuf = desc->audiobuf;  /* MODIFIED (md-speccy): from desc;
+                                        contents need no clear (consumer
+                                        only reads produced bits) */
     sys->audiobuf_byte = 0;
     sys->audiobuf_bit = 0;
     sys->audiobuf_notify = 0;
@@ -248,6 +257,12 @@ void zx_reset(zx_t* sys) {
     _zx_init_memory_map(sys);
 }
 
+/* MODIFIED (md-speccy): the per-tick path (_zx_tick + zx_exec, with the
+   mem.h accessors inlined into them) is compiled -O2 like z80_tick in
+   z80.h -- pure CPU-bound work, and this code lives in flash so the
+   size cost is free. */
+#pragma GCC push_options
+#pragma GCC optimize("O2")
 static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     pins = z80_tick(&sys->cpu, &sys->mem, pins);
 
@@ -327,7 +342,11 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     return pins;
 }
 
-uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
+/* MODIFIED (md-speccy): RAM-resident like z80_tick -- not for XIP reasons
+   but to kill the flash->RAM veneer on the z80_tick call, which fires
+   once per emulated tick (~47k times per frame, ~0.5-1 ms of thunk
+   overhead). _zx_tick and the mem.h accessors inline into this. */
+uint32_t __not_in_flash_func(zx_exec)(zx_t* sys, uint32_t micro_seconds) {
     CHIPS_ASSERT(sys && sys->valid);
     const uint32_t num_ticks = clk_us_to_ticks(sys->freq_hz, micro_seconds);
     uint64_t pins = sys->pins;
@@ -377,6 +396,8 @@ uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
     kbd_update(&sys->kbd, micro_seconds);
     return num_ticks;
 }
+
+#pragma GCC pop_options  /* MODIFIED (md-speccy): end of -O2 region */
 
 void zx_key_down(zx_t* sys, int key_code) {
     CHIPS_ASSERT(sys && sys->valid);

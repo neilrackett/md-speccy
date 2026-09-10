@@ -113,10 +113,28 @@ was dropped when input moved to a direct ST→Spectrum keyboard mapping.)
   ```
 
 ### CI / release
-- `.github/workflows/build.yml` builds `pico_w` on PR (the trigger is
-  commented out locally — check before relying on it).
-- `.github/workflows/release.yml` runs on `v*` tags: builds, attaches
-  UF2 + JSON to the Release, uploads to `s3://atarist.sidecartridge.com/`.
+Both workflows are ports of md-doom's and are **live** (the old ones had
+their triggers commented out, so nothing ran automatically).
+- `.github/workflows/pr.yml` — on PRs to `main`, runs the same bare
+  `make` the release does, so a PR that would break the release fails
+  here. Tags nothing, publishes nothing, keeps no artifacts. Read-only
+  token; no UUID secret, so it works from forks and builds under the
+  sample UUID.
+- `.github/workflows/release.yml` — **rolling release on every push to
+  `main`** (not `v*` tags any more): builds, tags `version.txt`, moves
+  the lightweight `latest` tag, and clobbers the two assets on the
+  existing `latest` GitHub Release (title and body untouched). The app
+  UUID comes from the `APP_UUID_KEY` secret.
+
+The workflows these replaced came from the upstream template and
+published to SidecarTridge's own infrastructure; the S3 upload to
+`s3://atarist.sidecartridge.com/` went with them deliberately. Releases
+are also no longer versioned GitHub Releases with a CHANGELOG body —
+there is one `latest` release whose binaries are replaced. Both
+workflows track the *latest* atarist-toolkit-docker
+installer rather than pinning v1.3.0, because the pinned one derived the
+Docker image tag from the ambient `$VERSION` that `build.sh` exports and
+so looked for an image named after the app's own version.
 
 ### Tests / verification
 No test suite. Verification is: **build succeeds** (both targets),
@@ -187,13 +205,74 @@ VBL** — one call per loop paces the app to 50 Hz.
    VBL read (`fb_publish` blocks until that read), then the next
    iteration wipes it, so a later reset auto-boots MD/Speccy cleanly.
 
-### Audio pipeline (YM2149)
+### Audio pipeline (STE DMA with YM fallback)
 
-RP fills a 1 KB cart buffer at `$FA4100` with (vA, vB) volume pairs;
-m68k Timer-B (`/4`, TBDR=110 → ~5,585 Hz, ~112 fires/PAL VBL) writes both
-YM volume regs per fire. `userfw_vbl` resets the A0 read cursor to the
-buffer base every VBL (the resync edge). MD/Speccy installs its own fill
-callback (`audio_set_fill_callback`) — see port section.
+Two back-ends, both compiled into `userfw.s`, chosen at boot from the
+`_SND` cookie (bit 1 = DMA/PCM sound; design shared with md-mjpeg):
+
+- **STE DMA** — mono 8-bit signed PCM @ 25,033 Hz, loop-mode DMA over a
+  double buffer parked in the unused tails of the two screen pages
+  (`$77D00`/`$7FD00`, 512 B each — no extra ST RAM). Each VBL
+  `.after_copy` copies fresh bytes from the cart audio buffer into
+  whichever half the DMA isn't reading (bit 7 of `$FF890B`). Timer-B and
+  the YM stay untouched; the exit path stops the DMA and Timer-A before
+  returning to GEM. Two details are load-bearing (both learned on
+  hardware in md-doom — don't "simplify" either away):
+  - **START/END are written by `userfw_snd_irq`, never by the VBL
+    loop.** MFP Timer-A runs in event-count mode off the DMA's frame
+    end, so the handler re-points the loop at the buffer the chip just
+    left, a full frame before the next latch. From the VBL loop the six
+    byte writes sat at an arbitrary phase of the DMA frame; when the
+    chip's drift brought its frame end into that ~6 µs window it latched
+    START from one buffer and END from the other and played the 32 KB
+    between them — ~1.3 s of noise, every few minutes.
+  - **The buffer length is measured, not assumed.** The DMA and the
+    video run off different oscillators, so the chip eats ~501.5 bytes
+    per frame, not 500, and it varies by machine. `.after_copy` watches
+    the drift of the DMA's within-buffer offset (sampled every frame,
+    nudged ±1 every fourth so it can't hunt; jumps >64 are handovers and
+    ignored) and steers `UFW_SND_LEN` between `STE_SND_LEN_MIN/MAX`.
+    A fixed 500 runs the buffer dry about every 350 frames and replays
+    one — the ~7-second crackle. Validated offline: converges and stays
+    dry-free for chip rates 498.5–503.2.
+- **YM fallback** (plain ST / early TOS) — RP fills the 1 KB cart buffer
+  at `$FA4100` with (vA, vB) volume pairs; m68k Timer-B (`/4`, TBDR=110
+  → ~5,585 Hz, ~112 fires/PAL VBL) writes both YM volume regs per fire.
+  `userfw_vbl` resets the A0 read cursor to the buffer base every VBL.
+
+The m68k reports the detected capability every VBL via a cart read at
+`SNDCAP_WINDOW_BASE + has_dma` (`$FB8600/1`), and in DMA mode the
+measured length at `SNDLEN_WINDOW_BASE + len - STE_SND_LEN_MIN`
+(`$FB8C00`). `fb_rom3_dispatch` hands both to
+`audio_consume_rom3_sample()`, which owns the windows →
+`audio_set_mode()` / `audio_set_fill_bytes()` (`AUDIO_SNDLEN_BIAS` must
+match `STE_SND_LEN_MIN`; out-of-band lengths are ignored as bus noise).
+`AUDIO_MODE_SILENT` zeros until the first report. **The fill callback
+must produce however many bytes it is asked for** — that is what makes
+the steering inaudible, and `zxemu_audio_fill` does it by resampling
+onto the requested count.
+
+**The refill runs on a 1 ms timer on Core 1, not the main loop**
+(`audio_start_vbl_timer(1)` in `emul.c`; a Core 1 alarm pool binds the
+IRQ there). The handler peeks the ROM3 ring non-destructively
+(`commemul_scan`, its own cursor, so it steals nothing from the IKBD
+demux) for the m68k's end-of-blit ack at `$FB8400` and fills right
+after it — after the m68k copied the previous buffer, before it copies
+the next, so it can never tear under the copy. This decouples audio
+from frame rate: the m68k drains its buffer every 20 ms whatever an
+emulated frame costs, and when the main loop ran slower than the VBL it
+skipped fills and the m68k replayed a stale buffer (the distortion).
+Nothing on the emulator path calls `audio_render_frame()` any more.
+md-doom measured the same timer on **Core 0** stalling its renderer for
+100–200 ms every second or two (mechanism never identified), so keep it
+on Core 1. Safe here because md-speccy's only flash write is at boot,
+before the timer starts.
+`FORCE_NO_DMA=1` (m68k build flag) exercises the YM path on DMA
+hardware. **The MFP auto-EOI flip is deliberately common code before the
+audio branch** — unlike md-mjpeg (polled ACIA), our interrupt-driven
+IKBD handler needs auto-EOI in both modes; putting it in the YM-only
+block would wedge the keyboard on STE machines. MD/Speccy installs its
+own fill callback (`audio_set_fill_callback`) — see port section.
 
 ### Shared 64 KB cartridge region
 
@@ -219,9 +298,12 @@ hard-code. Key offsets: cartridge image (16 KB), `CMD_MAGIC_SENTINEL`
   VBL-synced hand-off. (`fb_render_frame` and the internal demo sprite
   are legacy and now only paint the boot frame; MD/Speccy overwrites it.)
 - `commemul.c` — ROM3 cart-bus capture ring. **The ring was shrunk from
-  32 KB to 4 KB** for MD/Speccy (`COMM_RING_BITS` 15→12) — it only carries
-  IKBD bytes (<1/ms, drained sub-ms), and the RAM was needed for the
-  emulator.
+  32 KB to 1 KB** for MD/Speccy (`COMM_RING_BITS` 15→10) — it only
+  carries IKBD bytes plus a few per-VBL report reads, and the RAM was
+  needed for the emulator. `commemul_poll()` consumes; `commemul_scan()`
+  peeks non-destructively with a caller-owned cursor, which is how the
+  audio refill interrupt watches for the VBL ack without stealing
+  samples from the IKBD demux.
 - `ikbd.c` / `ikbd.h` — IKBD ingest + demux; `ikbd_pop_key`. Gained a
   gated joystick packet parser + `ikbd_get_joystick()` for the port.
 - `romemul.*`, `sdcard.c`, `hw_config.c`, `gconfig.c`, `aconfig.c`,
@@ -284,20 +366,34 @@ the c2p worker.**
 | --- | --- |
 | ST77xx display driver | `update_display()` decodes 256×192 VRAM → `fb_chunked_buffer` at (32,4), one palette index/pixel, then `fb_publish()` |
 | GPIO buttons | `zxemu_handle_key()` applies ST keys directly via `zx_key_down/up`; the cursor cluster + ST joystick drive `zx_joystick()` (Kempston) |
-| PWM beeper on Core 1 | `zxemu_audio_fill` → YM (Core 1 freed for c2p) |
+| PWM beeper on Core 1 | `zxemu_audio_fill` → STE DMA PCM or YM (Core 1 freed for c2p) |
 | flash game blob | FatFs enum of `/speccy`, `.z80` via `zx_quickload`, `.sna` via `zx_quickload_sna` |
 
 ### Display decode (validated offline)
 
-`update_display()` (in `zxemu.c`, `__not_in_flash_func`): clears the FB
-to the border colour, then for each of 192 rows reads the Spectrum
-bitmap byte at `((py&0xC0)<<5)|((py&0x07)<<8)|((py&0x38)<<2)|(px>>3)` and
-attribute at `0x1800+((py>>3)<<5)+(px>>3)`, applies BRIGHT
-(`(attr&0x40)>>3` → +8 to the index) and FLASH (swap ink/paper when the
-frame counter's blink phase is set), and writes the palette index to
-`fb_chunked_buffer[(4+py)*320 + 32 + x]`. The 16 ZX colours are pushed to
-the ST shifter palette in `zx_set_palette()` (`zxpalette` is `0x00BBGGRR`
-→ `PALETTE_RGB` 3-bit channels).
+`update_display()` (in `zxemu.c`, `__not_in_flash_func`, `-O2` region) is
+**dirty-row incremental**: the `mem.h` write hooks maintain a per-row
+bitmap (`EMU.dirty_vram`, one bit per scanline; attribute writes mark all
+8 covered rows) and only flagged rows are re-decoded; the border/canvas
+is cleared only when the border colour changes
+(`EMU.last_update_border_color`, `0xff` = forced). **Anything that
+touches VRAM or the framebuffer behind the hooks must call
+`vram_force_dirty()` first** — current callers: the FLASH blink toggle,
+the menu/About overlay draw *and* its restore, `load_game()` (snapshots
+write VRAM directly and borrow `fb_chunked_buffer`), and
+`init_emulator()`. Missing one shows up as stale screen regions.
+
+Per row it reads the Spectrum bitmap byte at
+`((py&0xC0)<<5)|((py&0x07)<<8)|((py&0x38)<<2)|(px>>3)` and attribute at
+`0x1800+((py>>3)<<5)+(px>>3)`, applies BRIGHT (`(attr&0x40)>>3` → +8)
+and FLASH (swap ink/paper on blink phase), and writes each 8-pixel cell
+as **two 32-bit stores** through the `zx_nib_mask[16]` nibble→byte-lane
+table (`(inkw & m) | (paperw & ~m)`) into
+`fb_chunked_buffer[(4+py)*320 + 32 ...]` — byte-for-byte identical to
+the old per-pixel loop (validated offline over every bits/attr/blink
+combination). The 16 ZX colours are pushed to the ST shifter palette in
+`zx_set_palette()` (`zxpalette` is `0x00BBGGRR` → `PALETTE_RGB` 3-bit
+channels).
 
 ### Input (direct ST→Spectrum mapping — replaced the keymap system)
 
@@ -342,9 +438,14 @@ play.
 
 ### Joystick ingest (always on, hardware-confirmed)
 
-`ikbd.c` runs a small state machine consuming `$FE/$FF` (one stick) /
-`$FD` (both) packets into `s_joy_state` (bit0 up,1 down,2 left,3 right,7
-fire), exposed via `ikbd_get_joystick()`; `zxemu_render_frame` folds those
+`ikbd.c` runs a small state machine consuming `$FE` (joystick 0) / `$FF`
+(joystick 1) / `$FD` (both, 0 then 1) packets into per-port
+`s_joy_state[2]` (bit0 up,1 down,2 left,3 right,7 fire; masked to
+`$8F`), with `ikbd_get_joystick()` reporting **port 1 only** — with
+event reporting on (`$14`) the port-0 mouse reports as joystick 0, and a
+stationary mouse's quadrature lines latch a steady non-zero byte that
+would otherwise clobber the real stick (games polling Kempston for a
+clear port then never start); `zxemu_render_frame` folds those
 bits into the Kempston mask (in play) or into menu navigation (in menu).
 The m68k side is the interrupt-driven ACIA handler in the IKBD pipeline
 above (`userfw_acia_irq` + `$12`/`$14` sends). This is what made it
@@ -364,22 +465,36 @@ it back to the menu.
 
 ### Audio
 
-`zxemu_audio_fill(buf, bytes)` decimates the beeper. The emulator samples
-the 1-bit beeper into `zx.audiobuf` during `zx_exec` (enabled because
-`SPEAKER_PIN != -1`; one bit per 16 ticks into a 256×32-bit ring). Each
-per-VBL fill box-filters the ~5.5 K bits since the last fill into 112
-output windows whose bounds tile the span exactly (Bresenham — a fixed
+`zxemu_audio_fill(buf, bytes)` decimates the beeper into whichever
+format `audio_get_mode()` reports. The emulator samples the 1-bit beeper
+into `zx.audiobuf` during `zx_exec` (enabled because `SPEAKER_PIN !=
+-1`; one bit per 16 ticks into a 256×32-bit ring ≈ 218.75 kHz). Each
+per-VBL fill box-filters the ~5.5 K bits since the last fill into output
+windows whose bounds tile the span exactly (Bresenham — a fixed
 `avail/nsamp` step used to drop the division remainder, ~0.4 ms of
-timeline per fill, phase-jumping every sustained tone at 50 Hz), then
-maps each window's duty cycle through `duty_att[]` (round(−2·log₂ duty)
-YM steps below the menu-volume peak) so linear amplitude tracks duty on
-the YM's ~3 dB/step logarithmic DAC — a plain `duty*vmax` companded the
-filtered edges into near-silence. Same level on both channels. Template
-side, the refill gate `AUDIO_FRAME_PERIOD_US` (audio.c) is 15 ms: at
-20 ms it raced the ~20.03 ms ST PAL VBL, and a lost race skipped a fill,
-replaying a stale buffer for a frame while the producer overran the ring
-(the old intermittent distortion). Approximate ("recognisable, not
-hi-fi").
+timeline per fill, phase-jumping every sustained tone at 50 Hz). In
+**DMA mode** each window's duty maps linearly to a signed sample
+(−amp..+amp, amp from the menu volume) — no companding, the PCM value
+IS the amplitude. In **YM mode** duty goes through `duty_att[]`
+(round(−2·log₂ duty) YM steps below the menu-volume peak) so linear
+amplitude tracks duty on the YM's ~3 dB/step logarithmic DAC — a plain
+`duty*vmax` companded the filtered edges into near-silence. Same level
+on both YM channels. The
+number of output windows is whatever the m68k asked for that VBL, which
+is what lets the DMA length steering work; don't hard-code it.
+(`AUDIO_FRAME_PERIOD_US` / `audio_render_frame()` are now only the
+fallback path for apps that still pump audio from their main loop —
+md-speccy uses the Core 1 timer instead.) The result is approximate on
+YM ("recognisable, not hi-fi") and considerably cleaner on STE DMA,
+where 25 kHz linear PCM resolves the beeper's square edges ~4.5x finer
+than the 5.6 kHz log-DAC path.
+
+**The fill runs in a Core 1 interrupt while `zx_exec` produces on
+Core 0.** It reads `audiobuf_byte` then `audiobuf_bit`, in that order,
+which is what keeps it safe without a lock: the producer only moves
+forward, so a torn read yields a write index at or behind the true one,
+never ahead — `avail` can't wrap negative. Keep that order if you touch
+it.
 
 ### SD games
 
@@ -399,20 +514,72 @@ file any more — input is the direct mapping described above.)
 
 ### RAM budget — CRITICAL, read before adding statics
 
-The 48 KB Spectrum RAM (`zx_t.ram[3][0x4000]`) is irreducible, so the
-port only just fits the 192 KB region (links with ~15 KB heap headroom).
-`.bss`+heap must not cross `0x20030000`. If you overflow `RAM`, the
-reclaims that made it fit were:
+The 48 KB Spectrum RAM (`zx_t.ram[3][0x4000]`) is irreducible, and the
+22 KB Z80 decoder is pinned into RAM as well, so the port only just fits
+the 192 KB region. `.bss`+heap must not cross `0x20030000`.
+
+**The heap floor is ~9.5 KB — an overflow here does NOT fail the link.**
+The boot-time settings library mallocs a **4 KB buffer each for gconfig
+and aconfig (held forever)** plus a ~4.2 KB transient per init
+(`settings_init`, entries copy), peaking at ~8.4 KB *before `emul_start`
+even runs*. On top of the 8.2 KB held, FatFs (LFN=3 + exFAT) adds
+~1.1 KB per open file/dir — one context at a time, because
+`populate_games_list` closes its dir before the builtin seeding opens a
+file — and the Core 1 audio alarm pool ~56 B, so runtime peaks at
+~9.4 KB. (Nest a `f_open` inside an open dir and that becomes ~10.5 KB.)
+If a boot-time malloc fails, `gconfig_init`/`aconfig_init` fail and
+`main.c` **jumps to Booster** — the symptom is "app launches then lands
+straight back in Booster", which looks like a crash but is a deliberate
+bail. Check heap after every RAM change: `0x20030000 - __bss_end__` in
+the `.map` (currently ~10.8 KB release / ~10.5 KB debug, i.e. ~1.1-1.4 KB
+of margin — thin, so weigh any new RAM-resident code against it).
+
+**Byte arithmetic is not enough**: newlib's full malloc grows the heap
+in **page-rounded (4 KB) sbrk steps**, so without countermeasures a
+malloc can fail on the rounding excursion while the actual bytes fit —
+the settings sequence needs a ~12.5 KB window that way, and diagnosing
+it from the `.map` shows a seemingly-sufficient heap. The build sets
+`PICO_USE_OPTIMISTIC_SBRK=1` (rp/src/CMakeLists.txt) so an over-limit
+sbrk grant is clamped to `__StackLimit` instead of failing; newlib's
+dlmalloc re-queries the actual break after each grant (verified in the
+disassembly), so the clamp is safe and the whole window is usable. Do
+not remove that define — every build maps back to Booster without it.
+
+If you overflow `RAM` (or the heap floor), the reclaims that made it
+fit were:
 
 1. **ZX ROM `const`** — `zx-roms.h` arrays were `unsigned char` (→ 16 KB
    in `.data` RAM!); made `const` → flash. Keep them const.
 2. **ROM mapped from flash** — `zx.h` `zx_t.rom[1][0x4000]` (a 16 KB RAM
    copy) replaced with a `const uint8_t* rom0` pointer into the flash
    array. `MODIFIED (md-speccy)`.
-3. **ROM3 ring 32 KB→4 KB** — `commemul.c COMM_RING_BITS` 15→12.
-4. Dropped a 50 KB `static zx_t im` from the unused `zx_load_snapshot`
+3. **ROM3 ring 32 KB→4 KB→2 KB** — `commemul.c COMM_RING_BITS` 15→12→11.
+4. **The cartridge-region hole** — the shared 64 KB region has 15,872
+   unused bytes between `CART_APP_FREE_OFFSET` (`$4500`) and
+   `CART_FRAMEBUFFER_OFFSET` (`$8300`) — verified unused: the m68k
+   defines `APP_FREE_ADDR` but never references it, and every RP-side
+   cart writer stays outside it. It is ordinary SRAM, so `memmap_rp.ld`
+   maps a `CART_APP_FREE` region over it and a `.cart_app_free` output
+   section parks `commRing` (1 KB), `GamesTable` (2.25 KB),
+   `s_vram_save` (6.75 KB), the `zx_t` audio ring (1 KB, now a pointer —
+   `MODIFIED` in `zx.h`), both `mem.h` dummy pages (2 KB, `MODIFIED`)
+   and the demo sprite (256 B) there — **~13 KB reclaimed from `RAM`**,
+   ~1.5 KB still free. Tag a buffer into it with
+   `__attribute__((section(".cart_app_free.<name>")))`.
+   Constraints: the section is `NOLOAD`, so nothing there is zero-inited
+   by the CRT — only park buffers first touched **after** `emul_start()`
+   wipes the region (`ERASE_FIRMWARE_IN_RAM()`), and never anything a
+   pre-`main` consumer (newlib, settings, stdio) relies on being zeroed.
+   The DMA ring must come first: an output section inherits its widest
+   input alignment, so a naturally-aligned buffer placed later drags the
+   whole block up and wastes a full alignment unit. The region starts at
+   `$4800`, not `$4500`, for the same reason. Overflow is caught at link
+   time by the region length.
+5. **ROM3 ring 4 KB→1 KB** (on top of reclaim 3) and
+   **`ZX_MAX_GAMES` 128→64** — both sized generously vs. actual use.
+6. Dropped a 50 KB `static zx_t im` from the unused `zx_load_snapshot`
    (it was already `--gc-sections`'d away, so this was cosmetic — the
-   real wins were 1–3).
+   real wins were 1–5).
 
 Diagnose overflow with the linker `.map` (`rp/build-*/rp.elf.map`), not
 by estimating: `--gc-sections` drops unused statics, and non-`const`
@@ -421,14 +588,75 @@ the totals. A host `sizeof` probe over `rp/src/zx/*.h` (define
 `SPEAKER_PIN`, stub `vram_set_dirty_*`) gives struct sizes; `zx_t` is
 ~56.7 KB.
 
-### Speed (deferred)
+### Frame pacing
 
-Runs at the template's 225 MHz; the emulator stays in flash (XIP) and
-shares Core 0 with the cart bus, so it may run slow. Not yet optimised —
-the owner asked to get it working first. Levers if needed: `#pragma GCC
-optimize("O3")` on `zxemu.c`, `__not_in_flash_func` on the emulator hot
-path (needs `zx.h`/`z80.h` edits), higher clock/voltage (must re-tune the
-PIO cart-bus timing — risky).
+`zx_exec()` runs *at least* the requested ticks and then keeps going until
+the raster reaches the end of the bitmap (scanline 256), so what a call
+actually costs is set by that exit, not by the microseconds asked for.
+`zx_frame_usec()` in `zxemu.c` requests 200 scanlines' worth — comfortably
+inside the `(1, 256)` scanline window for every `scanline_period` the
+`scan-p` menu item allows — so **one call advances exactly one emulated
+frame**, matching the 50 Hz VBL that `fb_publish()` already paces us to.
+
+Upstream's flat `FRAME_USEC` of 25000 µs overshot the first frame's
+scanline 256 and ran on to the second: two emulated frames of work per
+displayed frame, i.e. 4.70 M ticks/s needed for full speed instead of
+2.35 M. That suited zx2040's SPI panel, which redrew far below 50 Hz.
+Don't reintroduce a fixed µs figure here. Validated offline by mirroring
+the `zx_exec` loop and `_zx_tick`'s raster logic over `scanline_period`
+10..500.
+
+### Speed
+
+Runs at the template's 225 MHz, sharing Core 0 with the cart bus.
+
+Measured at 225 MHz with `z80_tick` in flash: **39.5 ms per emulated
+frame = 1.19 M ticks/s = 51% of real time**, i.e. 189 CPU cycles per
+`z80_tick` call. An interpreter step should be 30–60, so the bulk of that
+was XIP stall — `z80_tick` is ~22 KB against a 16 KB XIP cache, so it
+missed on essentially every tick. Hence the `__not_in_flash_func` on it
+(`z80.h`, `MODIFIED (md-speccy)`) and the RAM reclaims above. Note this
+also means **overclocking alone could never have fixed it**: full speed
+needs 1.98x and 400 MHz offers at most 1.78x of core, diluted by a slower
+flash divider.
+
+**Measuring:** `zxemu_render_frame()` times `zx_exec()` and averages over
+a ~1 s window into `EMU.perf_exec_us` / `EMU.perf_fps_x10`. The About
+pop-over shows both (`emu 13.2ms  fps 50.0`), so a release build on
+hardware reports its own speed; debug builds also `DPRINTF` it each
+window. Under 20 ms of emulation per frame means full speed. The figures
+include the pop-over's own compositing cost, so they read slightly below
+the in-play rate.
+
+What was tried, and what the hardware measurements showed:
+
+1. **`z80_tick` out of XIP — done, and it bought nothing** (39.5 →
+   40.3 ms measured). The hot flash set was effectively cached all
+   along; the emulator is **CPU-bound**, not flash-bound. The pinning is
+   kept (it makes the hot path immune to the slower flash divider at
+   400 MHz) but don't expect residency changes to move the needle.
+2. **`-O2` on the per-tick path** (`z80_tick` in `z80.h`; `_zx_tick` +
+   `zx_exec` in `zx.h`, via `#pragma GCC push_options` regions — the
+   file default stays `-Os`). `-O2` `z80_tick` is slightly *smaller*
+   than `-Os` (22,124 B), so no RAM cost.
+3. **400 MHz / 1.30 V overclock** (`constants.h`), the only clock target
+   that wins: the SSI divisor must be even, so flash drops /2 → /4
+   (112.5 → 100 MHz; at 300 MHz sys, /4 = 75 MHz — slower than stock).
+   The divider is baked into boot_stage2 via a directory-property
+   definition in `rp/src/CMakeLists.txt` (verified in the bs2
+   disassembly: BAUDR = 4). The cart-bus PIO keeps its proven 225 MHz
+   wall-clock timing via `SAMPLE_DIV_FREQ = RP2040_CLOCK_FREQ_KHZ /
+   225000.f` (fractional-divider jitter ≤1 sysclk ≈ 2.5 ns against a
+   ~71 ns settle budget). `main.c` raises the voltage **before** the
+   clock (never run the higher frequency at the lower voltage, even
+   transiently). If a board can't do 400 MHz (silicon lottery), the
+   step-down ladder is in `constants.h`; remember /2 flash is only safe
+   at 225 MHz.
+
+Expected combined effect: 40.3 ms × ~0.85 (O2) ÷ 1.78 (clock) ≈ 19 ms —
+right at the 20 ms budget. If it lands short, the remaining ideas are
+per-game `scan-p` tuning (fewer emulated ticks/frame) and shaving
+`update_display`.
 
 ---
 

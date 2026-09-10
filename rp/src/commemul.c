@@ -8,20 +8,25 @@
 
 #include "commemul.h"
 
+#include "cart_shared.h"
 #include "commemul.pio.h"
 #include "constants.h"
 #include "debug.h"
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 
-#define COMM_RING_BITS 12u  /* md-speccy: ROM3 carries only IKBD bytes (<1/ms), drained sub-ms; 32K->4K to fit the emulator */
+#define COMM_RING_BITS 10u  /* md-speccy: ROM3 carries only IKBD bytes plus one VBL ack per frame -- a handful of entries per drain, so 512 slots is ~50x headroom. 32K->4K->1K to fit the RAM-resident Z80 decoder + the heap the boot-time settings library needs. */
 #define COMM_RING_SIZE_BYTES (1ul << COMM_RING_BITS)
 #define COMM_RING_WORDS (COMM_RING_SIZE_BYTES / sizeof(uint16_t))
 #define COMM_RING_MASK (COMM_RING_WORDS - 1u)
 #define COMM_DMA_TRANSFER_COUNT (0xFFFFFFFFu)
 
+/* md-speccy: parked in the cartridge-region hole. The DMA ring wrap
+   still needs natural alignment, which the linker script guarantees by
+   placing the ring first in the section. */
 static uint16_t commRing[COMM_RING_WORDS]
-    __attribute__((aligned(COMM_RING_SIZE_BYTES)));
+    __attribute__((aligned(COMM_RING_SIZE_BYTES)))
+    __cart_app_free("commring");
 static uint32_t commReadIdx = 0;
 static int commDmaChannel = -1;
 static int commSm = -1;
@@ -81,6 +86,25 @@ int commemul_init(void) {
           commSm, commDmaChannel, (unsigned int)COMM_RING_WORDS,
           (unsigned int)COMM_RING_SIZE_BYTES);
   return 0;
+}
+
+bool __not_in_flash_func(commemul_scan)(uint32_t *cursor, uint16_t window_hi) {
+  if (!commInitialized) {
+    return false;
+  }
+  uint32_t transfersWritten =
+      COMM_DMA_TRANSFER_COUNT - dma_hw->ch[commDmaChannel].transfer_count;
+  uint32_t writeIdx = transfersWritten & COMM_RING_MASK;
+  uint32_t idx = *cursor & COMM_RING_MASK;
+  bool seen = false;
+  while (idx != writeIdx) {
+    if ((commRing[idx] & 0xFF00u) == window_hi) {
+      seen = true;
+    }
+    idx = (idx + 1u) & COMM_RING_MASK;
+  }
+  *cursor = writeIdx;
+  return seen;
 }
 
 void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback) {

@@ -174,29 +174,46 @@ static void push_key(uint8_t scancode, bool is_press) {
 
 /* ZX Spectrum port: joystick support. The m68k IKBD handler forwards
  * every byte interrupt-driven, so the multi-byte joystick packets
- * arrive intact and this demux frames them into s_joy_state. */
+ * arrive intact and this demux frames them into s_joy_state[].
+ *
+ * The two ports are kept separate and only port 1 is reported: with
+ * joystick event reporting on ($14), the mouse in port 0 reports as
+ * joystick 0, and a stationary mouse holds its quadrature lines in a
+ * fixed pattern -- a steady non-zero direction byte that, being
+ * change-triggered, latches forever. Folding both ports into one
+ * state let that phantom overwrite the real stick in port 1 (games
+ * that wait for the Kempston port to clear then never start). */
 
-/* Latest Atari ST joystick state (bit0 up, bit1 down, bit2 left,
- * bit3 right, bit7 fire). */
-static volatile uint8_t s_joy_state = 0;
-/* Number of joystick state bytes still expected after a packet header
- * ($FD -> 2 for both sticks, $FE/$FF -> 1 for one stick). */
+/* Latest joystick state per port (bit0 up, bit1 down, bit2 left,
+ * bit3 right, bit7 fire). [0] = port 0 (mouse), [1] = port 1. */
+static volatile uint8_t s_joy_state[2] = {0, 0};
+/* Which state bytes are still expected after a packet header, as a
+ * bit mask: bit0 = a port-0 byte, bit1 = a port-1 byte. $FD sends
+ * port 0 then port 1, so its first follow byte is the port-0 one. */
 static uint8_t s_joy_pending = 0;
 
-uint8_t ikbd_get_joystick(void) { return s_joy_state; }
+uint8_t ikbd_get_joystick(void) { return s_joy_state[1]; }
 
 void ikbd_pump(void) {
   uint8_t b;
   while (raw_pop(&b)) {
     /* Consume the state byte(s) that follow a joystick packet header so
-     * they are never misclassified as key scancodes. */
+     * they are never misclassified as key scancodes. Mask to the
+     * meaningful bits (directions + fire) so a stray byte swallowed
+     * here can't inject phantom bits that persist forever. */
     if (s_joy_pending) {
-      s_joy_state = b;
-      s_joy_pending--;
+      if (s_joy_pending & 1u) {
+        s_joy_state[0] = b & 0x8Fu;
+        s_joy_pending &= (uint8_t)~1u;
+      } else {
+        s_joy_state[1] = b & 0x8Fu;
+        s_joy_pending = 0;
+      }
       continue;
     }
-    if (b == 0xFEu || b == 0xFFu) { s_joy_pending = 1; continue; }
-    if (b == 0xFDu)               { s_joy_pending = 2; continue; }
+    if (b == 0xFEu) { s_joy_pending = 1; continue; }  /* joystick 0 */
+    if (b == 0xFFu) { s_joy_pending = 2; continue; }  /* joystick 1 */
+    if (b == 0xFDu) { s_joy_pending = 3; continue; }  /* both, 0 then 1 */
     if (b < 0x80u) {
       push_key(b, true);
     } else if (b < 0xF2u) {

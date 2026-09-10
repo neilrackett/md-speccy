@@ -95,6 +95,17 @@ pico_sdk_init()
 # FatFs) is built consistently.
 add_definitions(-DPICO_MALLOC_PANIC=0)
 
+# Newlib's full malloc grows the heap in page-rounded (4 KB) sbrk steps,
+# so with the default hard-fail _sbrk a request can die on the rounding
+# excursion even when the actual bytes fit (~3 KB of the window is
+# unreachable). Optimistic sbrk clamps an over-limit grant to
+# __StackLimit instead of failing, making the whole window usable; the
+# cap itself is unchanged, so the cart region stays protected. Without
+# this, the boot-time settings inits (2x 4 KB buffer + a 4.2 KB
+# transient each) need a ~12.5 KB window instead of their true ~8.4 KB
+# peak -- see the RAM-budget notes in AGENTS.md.
+add_definitions(-DPICO_USE_OPTIMISTIC_SBRK=1)
+
 add_subdirectory(settings)
 
 # Tell CMake where to find other source code
@@ -131,6 +142,17 @@ target_sources(${PROJECT_NAME} PRIVATE
         settings/settings.c)
 
 # Create map/bin/hex/uf2 files
+# 400 MHz sysclk (constants.h) needs the QSPI flash divider raised from
+# the board default /2 to /4: the SSI divisor must be even, and /2 would
+# put the flash SCK at 200 MHz, far over the ~133 MHz part limit (/4 =
+# 100 MHz). The divider is baked into boot_stage2 (the SDK's bs2_default
+# target), so set it on that target directly -- this fails loudly at
+# configure time if the SDK ever renames it, unlike a directory-property
+# injection which would silently no-op. The add_definitions covers the
+# app side (runtime prints / SDK uses).
+add_definitions(-DPICO_FLASH_SPI_CLKDIV=4)
+target_compile_definitions(bs2_default PRIVATE PICO_FLASH_SPI_CLKDIV=4)
+
 pico_add_extra_outputs(${PROJECT_NAME})
 
 # Link libraries required for the project

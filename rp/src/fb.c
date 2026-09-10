@@ -14,6 +14,7 @@
 
 #include <string.h>
 
+#include "audio.h"
 #include "cart_shared.h"
 #include "commemul.h"
 #include "debug.h"
@@ -52,7 +53,8 @@ static uint32_t s_vbl_published;
 #define DEMO_SPRITE_H 16
 #define DEMO_SPRITE_KEY 0xFFu
 
-static uint8_t demo_sprite_data[DEMO_SPRITE_W * DEMO_SPRITE_H];
+static uint8_t demo_sprite_data[DEMO_SPRITE_W * DEMO_SPRITE_H]
+    __cart_app_free("demo_sprite");  /* built at fb_init() */
 static const struct FB_BITMAP demo_sprite = {
     DEMO_SPRITE_W, DEMO_SPRITE_H, demo_sprite_data};
 
@@ -256,6 +258,9 @@ static void fb_rom3_dispatch(uint16_t sample) {
   if ((sample & FB_VBLSYNC_HIMASK) == FB_VBLSYNC_HIBYTE) {
     s_vbl_seen++;
   }
+  /* Sound-capability + buffer-length reports (audio.c owns both
+   * windows and the mapping to back-end / refill size). */
+  audio_consume_rom3_sample(sample);
 }
 
 void fb_pump_rom3(void) { commemul_poll(fb_rom3_dispatch); }

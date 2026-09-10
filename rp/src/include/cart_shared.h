@@ -85,6 +85,18 @@
 #define CART_APP_FREE_OFFSET                                                  \
   (CART_AUDIO_BUFFER_OFFSET + CART_AUDIO_BUFFER_SIZE)
 
+/* Tag a buffer into the .cart_app_free linker section -- the unused
+ * RAM between APP_FREE and the framebuffer inside the shared region
+ * (see memmap_rp.ld), reclaimed so the 192 KB main RAM region can hold
+ * the RAM-resident Z80 decoder. Mirrors the pico-sdk __scratch_x()
+ * idiom. The section is NOLOAD: nothing here is zero-inited by the
+ * CRT, so only park buffers first touched after emul_start() has
+ * called ERASE_FIRMWARE_IN_RAM(), and never anything a pre-main
+ * consumer (newlib, settings, stdio) relies on being zeroed.
+ * emul_start() verifies the section stays inside the hole at boot. */
+#define __cart_app_free(name) \
+  __attribute__((section(".cart_app_free." name)))
+
 /* Framebuffer sized for low-res 4 bpp (320 x 200 = 32000 bytes). Sits
  * flush against the top of the 64 KB region: end = $FB0000 exactly,
  * start = $FB0000 - 32000 = $FA8300. APP_FREE's upper bound is

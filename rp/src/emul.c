@@ -19,6 +19,7 @@
 
 #include "aconfig.h"
 #include "audio.h"
+#include "cart_shared.h"
 #include "commemul.h"
 #include "constants.h"
 #include "debug.h"
@@ -62,6 +63,20 @@ void emul_start() {
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
   const char *folderName = folder ? folder->value : "/speccy";
 
+  // The .cart_app_free buffers live inside the shared region's unused
+  // hole. The linker script hard-codes that window (ld cannot read C
+  // headers), so verify it here against cart_shared.h's authoritative
+  // offsets -- a drifted script would let the ST-visible layout and the
+  // parked buffers collide.
+  {
+    extern char __cart_app_free_start__[], __cart_app_free_end__[];
+    const char *base = (const char *)&__rom_in_ram_start__;
+    if (__cart_app_free_start__ < base + CART_APP_FREE_OFFSET ||
+        __cart_app_free_end__ > base + CART_FRAMEBUFFER_OFFSET) {
+      panic(".cart_app_free outside the shared-region hole");
+    }
+  }
+
   // Zero the whole 64 KB shared region so every byte the m68k can see is
   // deterministic, then copy the cartridge image into it.
   ERASE_FIRMWARE_IN_RAM();
@@ -91,9 +106,16 @@ void emul_start() {
   // Default palette; zxemu_init() overwrites it with the ZX palette.
   palette_init();
 
-  // Cart audio buffer producer. The beeper->YM fill callback is
-  // installed after the emulator core is up (it reads emulator state).
+  // Cart audio buffer producer. The beeper fill callback is installed
+  // after the emulator core is up (it reads emulator state).
   audio_init();
+
+  // Drive the refill from a 1 ms timer on Core 1 rather than the main
+  // loop: the m68k drains the cart buffer every VBL whatever the
+  // emulated frame costs, and a missed refill replays a stale buffer
+  // (audible as distortion). The Core 1 alarm pool binds the interrupt
+  // to Core 1 so it never preempts the emulator on Core 0.
+  audio_start_vbl_timer(1);
 
   // SD card -- best effort. Games live in `folderName`.
   FATFS fsys;
@@ -136,6 +158,6 @@ void emul_start() {
     }
 
     zxemu_render_frame();
-    audio_render_frame();
+    // No audio_render_frame() here: the Core 1 timer owns the refill.
   }
 }
