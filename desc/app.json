@@ -1,7 +1,7 @@
 {
   "uuid": "<APP_UUID>",
-  "name": "MD/Speccy: ZX Spectrum 48K",
-  "description": "MD/Speccy turns your SidecarT into a ZX Spectrum 48K running on your Atari ST! It comes with 2 great demos and you can add more simply by adding your favourite .z80 files into the /speccy folder on your SD card. For more information, visit <a href=\"https://neilrackett.com/atarist\">neilrackett.com</a>.",
+  "name": "MD/Speccy: ZX Spectrum 128K",
+  "description": "MD/Speccy turns your SidecarT into a ZX Spectrum 128K running on your Atari ST! It comes with 2 great demos and you can add more simply by adding your favourite .z80 and .sna files into the /speccy folder on your SD card. For more information, visit <a href=\"https://neilrackett.com/atarist\">neilrackett.com</a>.",
   "image": "https://downloads.neilrackett.com/md-speccy/image.webp",
   "tags": [
     "Emulator",

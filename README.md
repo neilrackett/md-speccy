@@ -6,7 +6,7 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 ## Introduction
 
-MD/Speccy turns your SidecarT into a ZX Spectrum 48K or 128K running on your Atari ST!
+MD/Speccy turns your SidecarT into a ZX Spectrum 128K running on your Atari ST!
 
 Don't have any games yet? Don't worry, MD/Speccy comes with 2 built-in demos, including my own ZX Spectrum port of [Pong Wars](https://github.com/neilrackett/zxspectrum-pongwars/releases), and there are loads of classic games available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) and [World of Spectrum](https://worldofspectrum.org/).
 
