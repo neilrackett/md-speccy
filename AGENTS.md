@@ -62,6 +62,7 @@ Top-level build is `build.sh`; day-to-day use the `Makefile`:
 make build      # pico_w release; uuid from uuid.txt / APP_UUID_KEY; no version bump
 make debug      # pico_w debug; bumps the patch version (tools/bump_version.sh)
 make uart       # screen console on the first serial device
+make emu        # run it in Hatari on this computer (EmuMD; see Tests / verification)
 make tag        # tag HEAD with version.txt and push (triggers release CI)
 
 # Or directly:  ./build.sh <pico|pico_w|sidecartos_16mb> <debug|release> <uuid>
@@ -143,6 +144,29 @@ No test suite. Verification is: **build succeeds** (both targets),
 **boots on hardware**, manual play + serial console. You usually can't
 flash — validate math offline (mirror the exact C in a host script, as
 the display decode was validated) and let the owner confirm on device.
+
+**EmuMD** runs the whole firmware on the host, inside Hatari: `make emu`
+(`emu/emu.mk`; `MACHINE=st` for a plain ST, `RECORD=out.avi` to record
+picture and sound). EmuMD is the `emu/emumd` submodule (`git submodule
+update --init emu/emumd`, then `make -C emu/emumd hatari` once to build
+its Hatari); `mdfw.ini` says how it builds MD/Speccy. Headless, with a
+screenshot: `emu/emumd/tools/mdfw run --headless --frames 600
+--screenshot out.png`. The emulated microSD is `emu/sd` (git-ignored;
+the built-ins are seeded into `emu/sd/speccy` at boot). What it needs
+from the firmware: `rp/src/fb_core1.c` is swapped for `emu/fb_core1.c`
+(a job and its argument are 64-bit pointers on the host, too wide for the
+inter-core FIFO), `emu/shim/` makes the `.cart_app_free` buffers ordinary
+variables and stubs `DPRINT_HEAP`, and `emul.c` skips its `.cart_app_free`
+linker-window check under `EMUMD`. Pointer casts in shared code must be
+`uintptr_t`, not `unsigned int`. The emulated Multi-device is infinitely
+fast, so speed (the About box's figures) and the Core 1 audio timer's
+cadence are not real — check those on hardware; picture, input, the
+cart-bus protocol and the YM/DMA audio paths are.
+
+If Hatari hangs at launch with no output (even `--version`) on macOS,
+it's AppKit's "reopen windows?" alert, hidden behind other windows, left
+by force-killed Hatari instances: `defaults write org.hatari-emu.Hatari
+ApplePersistenceIgnoreState -bool YES`.
 
 ---
 
@@ -593,10 +617,10 @@ mixer bits, volume, R13 sequence, the hold); the core test checks R13
 writes bump `ay_env_seq`; `ufw_ay_apply` was disassembled from
 `BOOT.BIN` (capstone) and checked instruction by instruction; 44 of the
 248 TOSEC 128K games have AY channels sounding 5 s after loading on the
-host core. Not run end to end: EmuMD could run this (see md-mjpeg /
-md-doom for the setup — it needs a Core 1 job stand-in, as their
-`emu/fb_chunked.c`, `uintptr_t` in `fb.c`, and the `.cart_app_free`
-check skipped under `EMUMD`), which would also record the YM's output.
+host core. Run end to end in EmuMD (see Tests / verification) on an STE
+and a plain ST: Taipan's music plays at the pitches the host core's AY
+registers give, stops on the menu's exit, and on the plain ST the
+beeper's key clicks and `BEEP` come back after a 48K is started.
 
 ### SD games
 
@@ -827,7 +851,7 @@ per-game `scan-p` tuning (fewer emulated ticks/frame) and shaving
 
 ## Editing guardrails
 
-- **Never modify** `pico-sdk/`, `pico-extras/`, `fatfs-sdk/` — pinned
+- **Never modify** `pico-sdk/`, `pico-extras/`, `fatfs-sdk/`, `emu/emumd/` — pinned
   submodules, re-pinned every build. Change FatFs config in
   `rp/src/ff/ffconf.h` (project override wins via `BEFORE PRIVATE`).
 - Don't add features to `main.c` — start in `emul.c` / `zxemu.c`.

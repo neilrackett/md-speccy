@@ -68,3 +68,5 @@ __pycache__/
 
 .DS_Store
 /tosec
+# The emulated microSD card (EmuMD): games are not ours to commit
+/emu/sd/

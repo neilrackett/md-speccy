@@ -12,6 +12,12 @@ on:
   push:
     branches:
       - main
+    # The EmuMD host build (emu/, including the submodule, and mdfw.ini)
+    # is not part of the firmware, so a change to nothing else does not
+    # need building. Keep this list the same in pr.yml and release.yml.
+    paths-ignore:
+      - 'emu/**'
+      - 'mdfw.ini'
   workflow_dispatch:
 
 permissions:

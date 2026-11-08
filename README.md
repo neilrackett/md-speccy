@@ -81,6 +81,18 @@ make debug
 make uart
 ```
 
+### Running it on your computer
+
+MD/Speccy also runs in [Hatari](https://www.hatari-emu.org) with [EmuMD](https://github.com/neilrackett/emumd), which builds the firmware for your computer and plays the part of the SidecarT, so you can try changes without flashing anything:
+
+```bash
+git submodule update --init emu/emumd
+make -C emu/emumd hatari   # once: builds EmuMD's Hatari and fetches EmuTOS
+make emu                   # MACHINE=st for a plain ST, RECORD=out.avi to record
+```
+
+The emulated microSD card is the `emu/sd` folder, so put your games in `emu/sd/speccy`. The emulated SidecarT is infinitely fast, so speed still needs checking on real hardware.
+
 For more on coding for the SidecarT, [the docs are here](https://docs.sidecartridge.com/sidecartridge-multidevice/programming/).
 
 ## License
