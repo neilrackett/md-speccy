@@ -34,8 +34,8 @@ author. (Also: no `Co-Authored-By` trailers at all, per the repo owner.)
 **MD/Speccy** — a **ZX Spectrum 48K / 128K emulator** for the Atari ST /
 STE / MegaST(E), built on the SidecarTridge Multi-device **framebuffer
 template**. (128K status: the model runs — banks, paging, ROMs, AY
-register file — and boots from the menu's `boot` item; 128K snapshots
-and AY sound on the YM are not done yet.) It is a port of [zx2040](https://github.com/antirez/zx2040)
+register file — boots from the menu's `boot` item and loads 128K `.z80`
+/ `.sna`; AY sound on the YM is not done yet.) It is a port of [zx2040](https://github.com/antirez/zx2040)
 (Salvatore Sanfilippo's RP2040 port of Andre Weissflog's `chips`
 emulator). The Spectrum runs entirely on the RP2040 in the cartridge; the
 ST is the screen, keyboard and speaker.
@@ -400,8 +400,9 @@ keeps the menu's `scan-p`, and carries the beeper ring indices across the
 wipe for the Core 1 fill, which reads `zx_audiobuf_store` directly). The
 menu's `boot` item (left/right: 48K/128K, fire: cold start) calls it;
 power-on is the 48K. Loaders call `zx_prepare_model()` after validating
-a file and before writing RAM, so a 48K snapshot on a running 128 gets a
-real 48K. Note `scan-p` (default 150), not the model, sets T-states per
+a file and before writing RAM: a cold start if the snapshot's model
+differs, else `zx_reset()` (so a 128 left locked by the last game is
+unlocked), then all RAM cleared. Note `scan-p` (default 150), not the model, sets T-states per
 emulated frame, so the 128 costs the same per frame as the 48K.
 
 Validated offline on the host build of the core: a Z80 program on the
@@ -556,16 +557,39 @@ it.
 `/speccy` (config `ACONFIG_PARAM_FOLDER`). `populate_games_list()` enumerates
 `.z80` and `.sna` (`snapshot_type()` classifies by extension);
 `load_game()` **streams** the snapshot from the file straight into
-Spectrum RAM through a 512-byte buffer (`s_load_buf`, in the cart hole):
-`zx_load_z80` (versions 1-3, 48K only; RLE decoded on the fly, raw
-`0xFFFF` pages and uncompressed v1 handled, 128K hardware modes rejected
-before anything is written) or `zx_load_sna` (27-byte header + raw 48 KB
-dump, PC popped RETN-style off the snapshot stack; 128K images are a
-different size and are rejected). Both live in `zxemu.c`; the vendored
-`zx_quickload` (whole file in memory) is no longer used. Validated
-offline against `zx_quickload` / the old `.sna` loader on the embedded
-games and generated v1/v2/v3/.sna files: identical RAM, registers, pins
-and border. No game auto-loads: boot leaves the menu active so the
+Spectrum RAM through a 512-byte buffer (`s_load_buf`, in the cart hole);
+each snapshot selects its own model (`zx_prepare_model`).
+
+- `zx_load_z80`: versions 1-3. RLE decoded on the fly (a block may end
+  in a lone `ED`, whose following byte belongs to the next block header —
+  don't consume it), raw `0xFFFF` pages and uncompressed v1 handled.
+  `z80_model()` maps the hardware mode: v2 0/1 and v3 0/1/3 are the 48K
+  (incl. IF1 / MGT variants, loaded even if their ROM was paged in — some
+  then reset to BASIC), v2 3/4 and v3 4/5/6/12 the 128 (incl. +2); SamRam,
+  +2A/+3, Pentagon, Timex are rejected before anything is written. The
+  extended header is indexed by the spec's byte offsets (`Z80X_*`): the
+  vendored `_zx_z80_ext_header` leaves out the 16 AY registers, so its
+  later fields are misaligned. 128: pages 3-10 → banks 0-7, then `$7FFD`
+  and the AY registers/selection from the extended header.
+- `zx_load_sna`: 48K (27-byte header + 48 KB, PC popped RETN-style) or
+  128K (131,103 / 147,487 B: banks 5, 2 and the paged bank, then PC,
+  `$7FFD`, TR-DOS flag, then the remaining banks ascending). The `$7FFD`
+  byte sits after the first 48 KB but decides where its last 16 KB go, so
+  it is read first via `zx_rd_seek()` (`f_lseek`). No AY state in `.sna`.
+  TR-DOS-paged images are rejected.
+
+Both live in `zxemu.c`; the vendored `zx_quickload` is unused.
+
+Validated offline on the TOSEC set in the git-ignored `tosec/` folder
+(4,719 `.z80`): all 4,435 48K files match the vendored `zx_quickload`
+except deliberate fixes (raw pages it refused, uncompressed v1 it
+mis-decoded or asserted on, `flags0 = 0xFF` read as 1 per the spec); an
+independent Python decoder written from the spec agrees on every bank,
+PC, `$7FFD`, AY register, screen bank, lock and CPU-visible mapping for
+all 4,435 48K and 248 128K files (35 unsupported machines and 1 corrupt
+file rejected); all 248 128K games run to title / game screens on the
+host core (sampled visually); and 128K `.sna` conversions of all 248
+(both sizes) load to the identical machine. No game auto-loads: boot leaves the menu active so the
 user always picks. After the scan, each entry in `BuiltinGames[]` is
 written to `/speccy` with `FA_CREATE_NEW` — present already, nothing
 happens; deleted by the user, it reappears next boot. (There is no keymap

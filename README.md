@@ -6,11 +6,11 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 ## Introduction
 
-MD/Speccy turns your SidecarT into a ZX Spectrum 48K running on your Atari ST!
+MD/Speccy turns your SidecarT into a ZX Spectrum 48K or 128K running on your Atari ST!
 
 Don't have any games yet? Don't worry, MD/Speccy comes with 2 built-in demos, including my own ZX Spectrum port of [Pong Wars](https://github.com/neilrackett/zxspectrum-pongwars/releases), and there are loads of classic games available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) and [World of Spectrum](https://worldofspectrum.org/).
 
-Any 48K game in `.z80` or `.sna` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card and they'll appear on the menu. (MD/Speccy is a 48K Spectrum, so 128K-only games and 128K snapshots won't run.)
+Any 48K or 128K game in `.z80` or `.sna` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card and they'll appear on the menu. Each snapshot starts on the Spectrum it was saved from. The 128K's AY music isn't played yet, and snapshots from the +2A/+3, Pentagon, SamRam or Timex machines, or saved with TR-DOS paged in, won't load.
 
 Ported from Andre Weissflog's [`chips`](https://github.com/floooh/chips), via Salvatore Sanfilippo's [zx2040](https://github.com/antirez/zx2040), so a massive thank you to both of them for their fantastic work!
 
@@ -38,7 +38,7 @@ Caps Lock.
 
 A real ST joystick works as Kempston too.
 
-The menu also has an **about** item (version and credits) and an **exit** item to quit back to GEM.
+The menu also has a **boot** item (← → to choose 48K or 128K, then select to start that Spectrum from its ROM), an **about** item (version and credits) and an **exit** item to quit back to GEM. In the 128K's start-up menu, use Shift+6 / Shift+7 (or set **cursor** to keys) and Return.
 
 ## Installation
 

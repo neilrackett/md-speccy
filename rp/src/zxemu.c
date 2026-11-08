@@ -107,7 +107,7 @@ static uint32_t zxpalette[16] = {
 void load_game(int game_id);
 void flush_zx_key_press(zx_t *zx);
 static void zx_start(zx_type_t type);
-static void zx_prepare_model(zx_type_t type);
+static void zx_prepare_model(zx_t *sys, zx_type_t type);
 
 /* =============================== Games list =============================== */
 
@@ -866,12 +866,20 @@ static bool zx_rd(zx_reader_t *r, uint8_t *dst, uint32_t n) {
     return true;
 }
 
+// Reposition to byte `pos` of the file (drops what's buffered).
+static bool zx_rd_seek(zx_reader_t *r, uint32_t pos) {
+    r->pos = r->len = 0;
+    return f_lseek(r->f, pos) == FR_OK;
+}
+
 // Decode one .z80 memory block into dst[0..cap) (dst NULL: skip it). The
 // format's RLE: "ED ED n b" is n copies of b, anything else is literal.
-// A version 2/3 block is exactly src_len input bytes. A version 1 image
-// (src_len 0) is the whole 48 KB, followed by a 00 ED ED 00 end marker
-// that a valid image can't contain earlier, so it ends once cap bytes
-// are out. Output past cap is dropped rather than overrunning RAM.
+// A version 2/3 block is exactly src_len input bytes, and may end in a
+// lone ED (the byte after it is the next block's header, so it must not
+// be consumed). A version 1 image (src_len 0) is the whole 48 KB, followed
+// by a 00 ED ED 00 end marker that a valid image can't contain earlier,
+// so it ends once cap bytes are out. Output past cap is dropped rather
+// than overrunning RAM.
 static bool zx_z80_unpack(zx_reader_t *r, uint8_t *dst, uint32_t cap,
                           uint32_t src_len) {
     uint32_t in = 0, out = 0;
@@ -880,7 +888,7 @@ static bool zx_z80_unpack(zx_reader_t *r, uint8_t *dst, uint32_t cap,
         if (b < 0) return false;
         in++;
         int n = 1;
-        if (b == 0xED) {
+        if (b == 0xED && (src_len == 0 || in < src_len)) {
             int b2 = zx_rd_byte(r);
             if (b2 < 0) return false;
             in++;
@@ -901,36 +909,63 @@ static bool zx_z80_unpack(zx_reader_t *r, uint8_t *dst, uint32_t cap,
     return true;
 }
 
-// Load a 48K .z80 snapshot (versions 1, 2 and 3): a 30-byte register
-// header; version 1 continues with the 48 KB image ($4000-$FFFF, RLE'd if
-// flags0 bit 5 is set), versions 2/3 (PC = 0 in the main header) with an
-// extended header and then one block per 16 KB page -- page 8 is $4000,
-// 4 is $8000, 5 is $C000; others are skipped. A block length of 0xFFFF
-// means 16 KB stored raw. A running 128 is restarted as a 48K first.
-// 128K images (hardware mode >= 3) are not loaded yet; they are rejected
-// before anything is written, leaving the running machine untouched.
-// Registers are set as upstream's zx_quickload() sets them.
+// .z80 extended header (versions 2/3), as bytes from file offset 32 (the
+// PC). Indexed by the format spec's offsets: the vendored struct leaves
+// out the AY registers, so its later fields are misaligned.
+enum {
+    Z80X_HW   = 2,     // hardware mode
+    Z80X_7FFD = 3,     // 128: last OUT to $7FFD
+    Z80X_FFFD = 6,     // last OUT to $FFFD (selected AY register)
+    Z80X_AY   = 7,     // the 16 AY registers
+    Z80X_MAX  = 55,    // longest extended header (version 3 with $1FFD)
+};
+
+// Model for a version 2/3 hardware mode (ext_len 23 = version 2), or -1
+// for machines this emulator isn't: SamRam, +2A/+3, Pentagon, Timex...
+// Interface 1 / MGT variants run as the plain machine.
+static int z80_model(uint32_t ext_len, uint8_t hw) {
+    if (ext_len == 23) {                             // version 2
+        if (hw <= 1) return ZX_TYPE_48K;             // 48K (+ IF1)
+        if (hw == 3 || hw == 4) return ZX_TYPE_128;  // 128K (+ IF1)
+    } else {                                         // version 3
+        if (hw <= 1 || hw == 3) return ZX_TYPE_48K;  // 48K (+ IF1 / MGT)
+        if ((hw >= 4 && hw <= 6) || hw == 12)        // 128K (+ IF1 / MGT),
+            return ZX_TYPE_128;                      // +2
+    }
+    return -1;
+}
+
+// Load a .z80 snapshot (versions 1, 2 and 3; 48K and 128K): a 30-byte
+// register header; version 1 (48K only) continues with the 48 KB image
+// ($4000-$FFFF, RLE'd if flags0 bit 5 is set), versions 2/3 (PC = 0 in the
+// main header) with an extended header and then one block per 16 KB page:
+// on the 48K page 8 is $4000, 4 is $8000, 5 is $C000; on the 128 pages
+// 3-10 are banks 0-7. Other pages (ROMs) are skipped. A block length of
+// 0xFFFF means 16 KB stored raw. The 128's $7FFD paging and AY registers
+// come from the extended header. Unsupported machines are rejected before
+// anything is written, leaving the running machine untouched. Registers
+// are set as upstream's zx_quickload() sets them.
 static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
     _zx_z80_header hdr;
-    _zx_z80_ext_header ext;
+    uint8_t e[Z80X_MAX];
     if (!zx_rd(r, (uint8_t *)&hdr, sizeof(hdr))) return false;
     if (hdr.flags0 == 0xFF) hdr.flags0 = 1;   // per the format spec
     uint16_t pc = (uint16_t)((hdr.PC_h << 8) | hdr.PC_l);
     const bool v1 = pc != 0;
+    zx_type_t type = ZX_TYPE_48K;
     if (!v1) {
-        // Extended header: its 2-byte length, then that many bytes, of
-        // which we keep what fits in the struct (23, 54 or 55 on disk).
-        memset(&ext, 0, sizeof(ext));
-        if (!zx_rd(r, &ext.len_l, 2)) return false;
-        const uint32_t len = (uint32_t)((ext.len_h << 8) | ext.len_l);
-        const uint32_t keep = len < sizeof(ext) - 2 ? len : sizeof(ext) - 2;
-        if (len < 3 || !zx_rd(r, &ext.PC_l, keep) ||
-            !zx_rd(r, NULL, len - keep))
-            return false;
-        if (ext.hw_mode >= 3) return false;
-        pc = (uint16_t)((ext.PC_h << 8) | ext.PC_l);
+        uint8_t l[2];
+        if (!zx_rd(r, l, 2)) return false;
+        const uint32_t len = (uint32_t)((l[1] << 8) | l[0]);
+        if (len != 23 && len != 54 && len != 55) return false;
+        memset(e, 0, sizeof(e));
+        if (!zx_rd(r, e, len)) return false;
+        const int model = z80_model(len, e[Z80X_HW]);
+        if (model < 0) return false;
+        type = (zx_type_t)model;
+        pc = (uint16_t)((e[1] << 8) | e[0]);
     }
-    zx_prepare_model(ZX_TYPE_48K);
+    zx_prepare_model(sys, type);
 
     if (v1) {
         uint8_t *mem = sys->ram[0];            // ram[0..2]: $4000-$FFFF
@@ -943,9 +978,14 @@ static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
         uint8_t ph[3];                         // len lo, len hi, page
         while (zx_rd(r, ph, sizeof(ph))) {
             const uint32_t len = (uint32_t)((ph[1] << 8) | ph[0]);
-            uint8_t *dst = ph[2] == 8 ? sys->ram[0] :
-                           ph[2] == 4 ? sys->ram[1] :
-                           ph[2] == 5 ? sys->ram[2] : NULL;
+            uint8_t *dst = NULL;
+            if (type == ZX_TYPE_128) {
+                if (ph[2] >= 3 && ph[2] <= 10) dst = sys->ram[ph[2] - 3];
+            } else {
+                dst = ph[2] == 8 ? sys->ram[0] :
+                      ph[2] == 4 ? sys->ram[1] :
+                      ph[2] == 5 ? sys->ram[2] : NULL;
+            }
             const bool ok = len == 0xFFFF ? zx_rd(r, dst, 0x4000)
                                           : zx_z80_unpack(r, dst, 0x4000, len);
             if (!ok) return false;
@@ -971,23 +1011,58 @@ static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
     sys->cpu.im = (hdr.flags1 != 0xFF) ? (hdr.flags1 & 3) : 1;
     sys->pins = z80_prefetch(&sys->cpu, pc);
     sys->border_color = (hdr.flags0 >> 1) & 7;
+    if (type == ZX_TYPE_128) {
+        _zx_update_memory_map_zx128(sys, e[Z80X_7FFD]);
+        sys->ay_addr = e[Z80X_FFFD] & 0x0F;
+        for (int i = 0; i < 16; i++)
+            sys->ay_regs[i] = e[Z80X_AY + i] & _zx_ay_reg_mask[i];
+    }
     return true;
 }
 
-// Load a 48K .sna snapshot: a 27-byte register header followed by a raw
-// 48 KB dump of $4000-$FFFF (no compression). PC is not in the header --
-// the save pushed it onto the stack, so loading emulates RETN: pop PC,
-// SP += 2, IFF2 -> IFF1. A running 128 is restarted as a 48K first. 128K
-// .sna images are a different size and are not loaded yet.
+// Load a .sna snapshot: a 27-byte register header and the 48 KB at
+// $4000-$FFFF (no compression). 48K: that's all, and PC isn't in the
+// header -- the save pushed it onto the stack, so loading emulates RETN:
+// pop PC, SP += 2, IFF2 -> IFF1. 128K: the 48 KB holds banks 5, 2 and the
+// bank paged at $C000, then come PC, the $7FFD value and a TR-DOS flag,
+// then the remaining banks in ascending order (the ones not already
+// saved: 5 more, or 6 if the paged bank was 2 or 5). The $7FFD byte is
+// needed before the first 48 KB can be placed, so it is read first. No
+// AY state is saved. TR-DOS snapshots (its ROM paged in) are rejected.
+#define SNA48_SIZE (27 + 0xC000)
 static bool zx_load_sna(zx_t *sys, zx_reader_t *r, uint32_t size) {
-    if (size != 27 + 0xC000) return false;
-    zx_prepare_model(ZX_TYPE_48K);
+    const bool is128 = size == SNA48_SIZE + 4 + 5 * 0x4000 ||
+                       size == SNA48_SIZE + 4 + 6 * 0x4000;
+    if (size != SNA48_SIZE && !is128) return false;
+    uint8_t x[4] = {0};                        // 128: PC lo/hi, $7FFD, TR-DOS
+    if (is128) {
+        if (!zx_rd_seek(r, SNA48_SIZE) || !zx_rd(r, x, sizeof(x)) ||
+            !zx_rd_seek(r, 0))
+            return false;
+        const uint8_t n = x[2] & 7;
+        const uint32_t rest = (n == 2 || n == 5) ? 6 : 5;
+        if (size != SNA48_SIZE + 4 + rest * 0x4000 || x[3] != 0) return false;
+    }
+    zx_prepare_model(sys, is128 ? ZX_TYPE_128 : ZX_TYPE_48K);
+
     uint8_t h[27];
-    if (!zx_rd(r, h, sizeof(h)) ||
-        !zx_rd(r, sys->ram[0], 0x4000) ||           // $4000
-        !zx_rd(r, sys->ram[1], 0x4000) ||           // $8000
-        !zx_rd(r, sys->ram[2], 0x4000))             // $C000
+    if (!zx_rd(r, h, sizeof(h))) return false;
+    if (is128) {
+        const uint8_t n = x[2] & 7;
+        if (!zx_rd(r, sys->ram[5], 0x4000) ||       // $4000
+            !zx_rd(r, sys->ram[2], 0x4000) ||       // $8000
+            !zx_rd(r, sys->ram[n], 0x4000) ||       // $C000
+            !zx_rd(r, NULL, sizeof(x)))
+            return false;
+        for (int b = 0; b < 8; b++) {
+            if (b == 2 || b == 5 || b == n) continue;
+            if (!zx_rd(r, sys->ram[b], 0x4000)) return false;
+        }
+    } else if (!zx_rd(r, sys->ram[0], 0x4000) ||    // $4000
+               !zx_rd(r, sys->ram[1], 0x4000) ||    // $8000
+               !zx_rd(r, sys->ram[2], 0x4000)) {    // $C000
         return false;
+    }
     z80_reset(&sys->cpu);
     sys->cpu.i   = h[0];
     sys->cpu.hl2 = (h[2] << 8) | h[1];
@@ -1004,9 +1079,16 @@ static bool zx_load_sna(zx_t *sys, zx_reader_t *r, uint32_t size) {
     sys->cpu.f = h[21]; sys->cpu.a = h[22];
     uint16_t sp = (h[24] << 8) | h[23];
     sys->cpu.im = h[25] & 3;
-    uint16_t pc = mem_rd(&sys->mem, sp) |
-                  (mem_rd(&sys->mem, (uint16_t)(sp + 1)) << 8);
-    sys->cpu.sp = (uint16_t)(sp + 2);
+    uint16_t pc;
+    if (is128) {
+        _zx_update_memory_map_zx128(sys, x[2]);
+        pc = (uint16_t)((x[1] << 8) | x[0]);
+    } else {
+        pc = mem_rd(&sys->mem, sp) |
+             (mem_rd(&sys->mem, (uint16_t)(sp + 1)) << 8);
+        sp = (uint16_t)(sp + 2);
+    }
+    sys->cpu.sp = sp;
     sys->pins = z80_prefetch(&sys->cpu, pc);
     sys->border_color = h[26] & 7;
     return true;
@@ -1144,10 +1226,15 @@ static void zx_start(zx_type_t type) {
 }
 
 // Snapshot loaders call this once the file has been validated, before
-// they write any RAM: a snapshot for another model restarts the machine
-// as that model (a 48K one on a running 128 gets a real 48K).
-static void zx_prepare_model(zx_type_t type) {
-    if (EMU.zx.type != type) zx_start(type);
+// they write any RAM: a clean machine of the snapshot's model -- a cold
+// start if the model changes (a 48K snapshot on a running 128 gets a real
+// 48K), otherwise a reset (so a 128 left with paging locked, say, is
+// unlocked) -- and cleared RAM, so nothing of the last game survives in
+// a bank the snapshot doesn't save. `sys` is always &EMU.zx here.
+static void zx_prepare_model(zx_t *sys, zx_type_t type) {
+    if (sys->type != type) zx_start(type);
+    else zx_reset(sys);
+    memset(sys->ram, 0, sizeof(sys->ram));
 }
 
 /* Load the specified game ID (index into GamesTable). */
