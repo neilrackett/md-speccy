@@ -1016,6 +1016,7 @@ static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
         sys->ay_addr = e[Z80X_FFFD] & 0x0F;
         for (int i = 0; i < 16; i++)
             sys->ay_regs[i] = e[Z80X_AY + i] & _zx_ay_reg_mask[i];
+        sys->ay_env_seq++;   // the YM starts the snapshot's envelope
     }
     return true;
 }
@@ -1363,6 +1364,73 @@ void zxemu_handle_key(const ikbd_key_event_t *k) {
 #endif
 }
 
+/* ============================== AY on the YM ============================== */
+
+// The 128's AY-3-8912 plays on the ST's own YM2149 (the same chip family).
+// Once per frame, right after the display decode -- so it lands between
+// the m68k's blit and its next VBL, like the framebuffer writes -- the
+// registers go into the cart's AY block (CART_AY_OFFSET) and the m68k
+// copies them into the YM at its next VBL (userfw.s ufw_ay_apply). On the
+// way:
+//   - tone, noise and envelope periods are rescaled from the AY's clock to
+//     the YM's, so pitches and envelope speeds stay the same;
+//   - mixer bits 6/7 are forced on: the YM's I/O ports are the ST's floppy
+//     select lines and printer port and must stay outputs (R14/R15, the
+//     ports themselves, are never sent);
+//   - fixed volumes follow the menu volume (envelope-driven ones can't);
+//   - R13 is only rewritten when the Spectrum wrote it (CART_AY_R13SEQ),
+//     because writing it restarts the envelope.
+// ACTIVE gives the YM to the AY. On a plain ST that silences the beeper,
+// which plays through the YM as a DAC, so it is held for a second after
+// the AY was last audible rather than flipping between the two in rests.
+// Register updates are per frame: music drivers write once per interrupt,
+// but sample playback through the AY's volume registers is lost.
+#define AY_CLOCK_HZ 1773447u   // the 128's AY: CPU clock / 2
+#define YM_CLOCK_HZ 2002653u   // the ST's YM: 8,010,613 Hz / 4
+#define AY_HOLD_FRAMES 50
+_Static_assert(CART_AY_OFFSET + CART_AY_SIZE <= 0x4800,
+               "AY block must stay below .cart_app_free");
+
+static uint32_t zx_ay_period(uint32_t p, uint32_t max) {
+    p = (uint32_t)(((uint64_t)p * YM_CLOCK_HZ + AY_CLOCK_HZ / 2) / AY_CLOCK_HZ);
+    return p > max ? max : p;
+}
+
+static void zx_ay_publish(void) {
+    static uint32_t hold;
+    const uint8_t *r = EMU.zx.ay_regs;
+    if (EMU.zx.type != ZX_TYPE_128) hold = 0;
+    else if ((r[8] | r[9] | r[10]) & 0x1F) hold = AY_HOLD_FRAMES;
+    else if (hold) hold--;
+
+    uint16_t v[14];
+    for (int ch = 0; ch < 3; ch++) {
+        const uint32_t p =
+            zx_ay_period(r[2 * ch] | ((uint32_t)r[2 * ch + 1] << 8), 0x0FFF);
+        v[2 * ch] = p & 0xFF;
+        v[2 * ch + 1] = (uint16_t)(p >> 8);
+    }
+    v[6] = (uint16_t)zx_ay_period(r[6], 0x1F);
+    v[7] = r[7] | 0xC0;
+    const uint32_t att = 15u - (EMU.volume * 15u) / 20u;
+    for (int ch = 0; ch < 3; ch++) {
+        uint32_t a = r[8 + ch];
+        if (EMU.volume == 0) a = 0;
+        else if (!(a & 0x10)) a = a > att ? a - att : 0;
+        v[8 + ch] = (uint16_t)a;
+    }
+    const uint32_t e = zx_ay_period(r[11] | ((uint32_t)r[12] << 8), 0xFFFF);
+    v[11] = e & 0xFF;
+    v[12] = (uint16_t)(e >> 8);
+    v[13] = r[13];
+
+    volatile uint16_t *blk = (volatile uint16_t *)
+        ((uint8_t *)&__rom_in_ram_start__ + CART_AY_OFFSET);
+    for (int i = 0; i < 14; i++) blk[CART_AY_REGS_WORD + i] = v[i];
+    blk[CART_AY_R13SEQ_WORD] = EMU.zx.ay_env_seq;
+    blk[CART_AY_ACTIVE_WORD] = hold != 0;
+}
+
 void zxemu_render_frame(void) {
     uint8_t joy = ikbd_get_joystick();  // bit0 up,1 down,2 left,3 right,7 fire
     static uint8_t prev_joy = 0;
@@ -1457,6 +1525,7 @@ void zxemu_render_frame(void) {
     fb_wait_vbl();
     const uint32_t td0 = time_us_32();
     update_display();
+    zx_ay_publish();
     const uint32_t td = time_us_32() - td0;
     acc_wait_us += td0 - tw;
     acc_disp_us += td;

@@ -33,9 +33,9 @@ author. (Also: no `Co-Authored-By` trailers at all, per the repo owner.)
 
 **MD/Speccy** — a **ZX Spectrum 48K / 128K emulator** for the Atari ST /
 STE / MegaST(E), built on the SidecarTridge Multi-device **framebuffer
-template**. (128K status: the model runs — banks, paging, ROMs, AY
-register file — boots from the menu's `boot` item and loads 128K `.z80`
-/ `.sna`; AY sound on the YM is not done yet.) It is a port of [zx2040](https://github.com/antirez/zx2040)
+template**. Both models run: the 128 boots from the menu's `boot` item
+or from a 128K `.z80` / `.sna`, and its AY music plays on the ST's own
+YM2149. It is a port of [zx2040](https://github.com/antirez/zx2040)
 (Salvatore Sanfilippo's RP2040 port of Andre Weissflog's `chips`
 emulator). The Spectrum runs entirely on the RP2040 in the cartridge; the
 ST is the screen, keyboard and speaker.
@@ -391,8 +391,9 @@ or 7, ROM, lock) and the AY at `$FFFD` (select / read) and `$BFFD`
 rewrite the same `$7FFD` value a lot; a remap is 16 page-table entries).
 **The AY is a register file only** — `ay_addr` + `ay_regs[16]`, masked on
 write as upstream / Fuse, port A reads `$BF` in input mode — so software
-reads back what it wrote; nothing is synthesised and nothing reaches the
-ST's YM yet. `zx_exec` stops at `top_border_scanlines + 192`.
+reads back what it wrote; nothing is synthesised on the RP — the ST's YM
+plays it (see Audio, "AY on the YM"). `ay_env_seq` counts envelope-shape
+(R13) writes. `zx_exec` stops at `top_border_scanlines + 192`.
 
 Model selection: `zx_start(type)` in `zxemu.c` cold-starts a model
 (`zx_init` wipes the machine, so it re-registers the extra key codes,
@@ -551,6 +552,51 @@ which is what keeps it safe without a lock: the producer only moves
 forward, so a torn read yields a write index at or behind the true one,
 never ahead — `avail` can't wrap negative. Keep that order if you touch
 it.
+
+### AY on the YM (the 128's music)
+
+The YM2149 is the AY-3-8912's sibling, so the 128's music plays on the
+real chip instead of being synthesised. Once per frame, right after
+`update_display()` (inside the post-ack window, so it never races the
+m68k), `zx_ay_publish()` writes the AY block at `$FA4500`
+(`CART_AY_OFFSET`, 16 words: ACTIVE, R13SEQ, R0-R13 as the low byte of
+each word) and `ufw_ay_apply` in `userfw.s` copies it into the YM at
+the top of the next VBL, at IPL 7 (~100 µs; ~10 µs when idle). On the way:
+
+- tone / noise / envelope periods are rescaled from the AY clock
+  (1,773,447 Hz) to the YM's (8,010,613 / 4 = 2,002,653 Hz) and clamped
+  (A4 lands 2.6 cents flat — integer periods);
+- mixer bits 6/7 are forced on — the YM's ports are the ST's floppy
+  select lines and printer port and must stay outputs; R14/R15 are never
+  sent;
+- fixed volumes follow the menu volume; envelope-driven ones can't;
+- R13 is only written when `R13SEQ` moved (or when the AY has just taken
+  the YM), because writing it restarts the envelope.
+
+**Who owns the YM.** On a DMA (STE) machine the beeper is DMA sound, so
+the YM is the AY's and both play together; ACTIVE going low just zeroes
+the three volumes. On a plain ST the beeper *is* the YM, as a DAC driven
+by Timer-B, whose handler relies on reg 8 staying latched between fires.
+So when ACTIVE rises the m68k masks Timer-B (IMRA bit 0) — the beeper
+goes quiet while the AY plays — and when it falls it restores the
+boot-time DAC setup (mixer `$FC`, R0-R3 = 0, ch C/B/A volumes 0, **reg 8
+latched last**) before unmasking. ACTIVE is held for 50 frames after the
+AY was last audible so music rests don't flip the YM back and forth.
+The exit to GEM silences the YM (mixer `$FF`, volumes 0).
+
+Limits: registers move once per frame — music drivers update once per
+interrupt, but sample playback through the AY volume registers (and
+beeper sound effects on a plain ST while music plays) is lost.
+
+Validated offline: a host test of `zx_ay_publish` (rescaling, clamps,
+mixer bits, volume, R13 sequence, the hold); the core test checks R13
+writes bump `ay_env_seq`; `ufw_ay_apply` was disassembled from
+`BOOT.BIN` (capstone) and checked instruction by instruction; 44 of the
+248 TOSEC 128K games have AY channels sounding 5 s after loading on the
+host core. Not run end to end: EmuMD could run this (see md-mjpeg /
+md-doom for the setup — it needs a Core 1 job stand-in, as their
+`emu/fb_chunked.c`, `uintptr_t` in `fb.c`, and the `.cart_app_free`
+check skipped under `EMUMD`), which would also record the YM's output.
 
 ### SD games
 

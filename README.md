@@ -10,7 +10,7 @@ MD/Speccy turns your SidecarT into a ZX Spectrum 48K or 128K running on your Ata
 
 Don't have any games yet? Don't worry, MD/Speccy comes with 2 built-in demos, including my own ZX Spectrum port of [Pong Wars](https://github.com/neilrackett/zxspectrum-pongwars/releases), and there are loads of classic games available on [Internet Archive](https://archive.org/details/zx_spectrum_tosec_set_september_2023) and [World of Spectrum](https://worldofspectrum.org/).
 
-Any 48K or 128K game in `.z80` or `.sna` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card and they'll appear on the menu. Each snapshot starts on the Spectrum it was saved from. The 128K's AY music isn't played yet, and snapshots from the +2A/+3, Pentagon, SamRam or Timex machines, or saved with TR-DOS paged in, won't load.
+Any 48K or 128K game in `.z80` or `.sna` format can be played using the Atari ST keyboard or a joystick, just drop them into the `/speccy` folder of your SD card and they'll appear on the menu. Each snapshot starts on the Spectrum it was saved from, and the 128K's AY music plays on your ST's own sound chip (a close relative of the AY). On an STE the beeper plays alongside it; on a plain ST the sound chip can only do one at a time, so beeper sounds are muted while music is playing. Snapshots from the +2A/+3, Pentagon, SamRam or Timex machines, or saved with TR-DOS paged in, won't load.
 
 Ported from Andre Weissflog's [`chips`](https://github.com/floooh/chips), via Salvatore Sanfilippo's [zx2040](https://github.com/antirez/zx2040), so a massive thank you to both of them for their fantastic work!
 
@@ -62,6 +62,7 @@ The RP2040 runs the full Spectrum on Core 0 and decodes its video memory straigh
 ```
 IKBD keyboard bytes        ──$FB82xx──►  demux → Spectrum keys / Kempston
 Blit to ST screen per VBL  ◄──$FA8300──  Spectrum VRAM → ST planar (changed rows)
+YM registers per VBL       ◄──$FA4500──  128K AY registers (music)
 Timer-B: write YM volumes  ◄──$FA4100──  beeper → (vA,vB) pairs, filled per VBL
 ```
 

@@ -167,9 +167,11 @@ typedef struct {
     const uint8_t* rom[2];
     /* MODIFIED (md-speccy): the 128's AY-3-8912 as a register file only
      * -- selected register and (masked) contents, so software can read
-     * back what it wrote. No synthesis here. */
+     * back what it wrote. No synthesis here: the front-end hands the
+     * registers to the ST's own YM2149 (zxemu.c zx_ay_publish). */
     uint8_t ay_addr;
     uint8_t ay_regs[16];
+    uint8_t ay_env_seq;     // bumped on every R13 write (envelope restart)
 } zx_t;
 
 // initialize a new ZX Spectrum instance
@@ -429,6 +431,7 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                     // AY register write $BFFD (10............0.)
                     sys->ay_regs[sys->ay_addr] =
                         Z80_GET_DATA(pins) & _zx_ay_reg_mask[sys->ay_addr];
+                    if (sys->ay_addr == 13) sys->ay_env_seq++;
                 }
             }
         }

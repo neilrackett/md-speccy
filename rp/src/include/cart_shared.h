@@ -36,14 +36,16 @@
  *                                        RANDOM_TOKEN_SEED for the
  *                                        former TPROTOCOL handshake;
  *                                        unused)
- *   $FA400C  FB_FRAME_COUNTER      4 B  (RP-incremented dirty-frame
- *                                        marker; m68k VBL loop skips
- *                                        the cart->ST blit when this
- *                                        is unchanged since the
- *                                        previous iteration)
+ *   $FA400C  FB_FRAME_COUNTER      4 B  (unused: the m68k blits
+ *                                        every VBL; kept so the
+ *                                        layout doesn't move)
  *   $FA4010  SHARED_VARIABLES    240 B  (60 indexed 4-byte slots,
  *                                        app-free).
- *   $FA4100  APP_FREE           ~16.5 KB free arena, ends at FRAMEBUFFER
+ *   $FA4100  AUDIO_BUFFER        1 KB  (beeper samples, see below)
+ *   $FA4500  AY block            32 B  (the 128's AY registers for the
+ *                                        YM, see CART_AY_OFFSET)
+ *   $FA4520  (free)                    up to the RP-only .cart_app_free
+ *                                        section at $FA4800
  *   $FA8300  FRAMEBUFFER          32 KB (320x200 4 bpp low-res)
  *   $FAFFFF  end of region
  */
@@ -84,6 +86,24 @@
 /* APP_FREE arena starts after the audio buffer. */
 #define CART_APP_FREE_OFFSET                                                  \
   (CART_AUDIO_BUFFER_OFFSET + CART_AUDIO_BUFFER_SIZE)
+
+/* AY block ($FA4500): the Spectrum 128's AY registers as the ST's YM
+ * should play them, published by the RP once per frame (zxemu.c
+ * zx_ay_publish) and copied into the YM by the m68k at its next VBL
+ * (userfw.s ufw_ay_apply). 16 words; a register's value is the low byte
+ * of its word.
+ *   word 0      ACTIVE  1: the AY owns the YM (plain ST: beeper DAC off)
+ *   word 1      R13SEQ  bumped on every envelope-shape (R13) write:
+ *                       writing R13 restarts the envelope, so the m68k
+ *                       only writes it when this moves
+ *   words 2-15  R0-R13
+ * Must match AY_BLOCK_ADDR in userfw.s, and stay below the RP-only
+ * .cart_app_free section (offset $4800, memmap_rp.ld). */
+#define CART_AY_OFFSET                   CART_APP_FREE_OFFSET   /* $4500 */
+#define CART_AY_ACTIVE_WORD              0
+#define CART_AY_R13SEQ_WORD              1
+#define CART_AY_REGS_WORD                2
+#define CART_AY_SIZE                     32
 
 /* Tag a buffer into the .cart_app_free linker section -- the unused
  * RAM between APP_FREE and the framebuffer inside the shared region

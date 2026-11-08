@@ -83,6 +83,8 @@ UFW_VBL_FLAG          equ $4C6               ; word: cleared by userfw_vbl, poll
 UFW_SND_LEN           equ $00077F00          ; word: current DMA buffer length in bytes
 UFW_SND_PREVPOS       equ $00077F02          ; word: DMA offset within its buffer, last VBL
 UFW_SND_TICK          equ $00077F04          ; byte: frame counter, steer on every 4th
+UFW_AY_ACTIVE         equ $00077F06          ; byte: the YM is the 128's AY (not the beeper DAC)
+UFW_AY_R13SEQ         equ $00077F08          ; word: last envelope-shape sequence written to the YM
 UFW_VBL_VEC_SAVE      equ $00077FE0          ; longword: TOS VBL vector ($70)
 UFW_HAS_DMA           equ $00077FE4          ; byte: 1 = STE DMA sound detected
 UFW_PHYSBASE_SAVE     equ $00077FE8          ; longword: XBIOS Physbase result
@@ -226,6 +228,15 @@ YM_REG_CHA_VOL        equ 8                  ; channel A volume (low 4 bits)
 YM_REG_CHB_VOL        equ 9                  ; channel B volume (low 4 bits)
 YM_MIXER_DAC_CHA      equ $FE                ; tone A enabled, all other tones/noise off, ports out
 YM_MIXER_DAC_AB       equ $FC                ; tones A AND B enabled, tone C off, all noise off, ports out (Ghostbusters dual-channel fake DAC)
+YM_REG_CHC_VOL        equ 10                 ; channel C volume
+YM_REG_ENV_SHAPE      equ 13                 ; envelope shape (a write restarts the envelope)
+YM_MIXER_ALL_OFF      equ $FF                ; all tones/noise off, ports out
+
+; The Spectrum 128's AY registers, published by the RP once per frame
+; (cart_shared.h CART_AY_*; must match). Word 0: the AY owns the YM;
+; word 1: envelope-shape write sequence; words 2-15: R0-R13, value in
+; the low byte. Applied by ufw_ay_apply each VBL.
+AY_BLOCK_ADDR         equ $00FA4500
 
 ; Cart-shared audio sample buffer (mirrors AUDIO_BUFFER_ADDR /
 ; AUDIO_BUFFER_SIZE in main.s and CART_AUDIO_BUFFER_OFFSET in
@@ -670,6 +681,11 @@ userfw:
     ; UFW_SCREEN_A and UFW_SCREEN_B via XOR with UFW_SCREEN_XOR.
     move.l  #UFW_SCREEN_A, UFW_SCREEN_PAGE
 
+    ; The YM starts as the beeper's (YM machines) or idle (DMA machines);
+    ; ufw_ay_apply hands it to the 128's AY when the RP asks.
+    sf      UFW_AY_ACTIVE
+    clr.w   UFW_AY_R13SEQ
+
     ; Shifter base HIGH byte ($07) is the same for both screen pages
     ; ($70000 and $78000), so we write it ONCE here and only update
     ; the MID byte per VBL in .after_copy below (saves ~20 cyc/VBL).
@@ -711,6 +727,10 @@ userfw:
     lea     PALETTE_ADDR, a5
     movem.l (a5), d0-d7
     movem.l d0-d7, PALETTE_BASE.w
+
+    ; The 128's AY music onto the YM (no-op unless the RP says the AY is
+    ; in use). Clobbers D0-D3/A1/A2, which the blit below clobbers anyway.
+    bsr     ufw_ay_apply
 
     ; A5 = END of the screen page chunk-covered region. FBDRV_INLINE
     ; uses predec MOVEM (`movem.l list, -(a5)`) and walks A5 backwards
@@ -890,6 +910,17 @@ userfw:
     clr.b   MFP_TBCR.w
     clr.b   MFP_TACR.w
 
+    ; Silence the YM: the AY may have left a note sounding (or the beeper
+    ; DAC a level). TOS sets the mixer up again when it next makes a sound.
+    move.b  #YM_REG_MIXER, YM_SELECT.w
+    move.b  #YM_MIXER_ALL_OFF, YM_DATA.w
+    move.b  #YM_REG_CHA_VOL, YM_SELECT.w
+    move.b  #0, YM_DATA.w
+    move.b  #YM_REG_CHB_VOL, YM_SELECT.w
+    move.b  #0, YM_DATA.w
+    move.b  #YM_REG_CHC_VOL, YM_SELECT.w
+    move.b  #0, YM_DATA.w
+
     ; Restore MFP IER / IMR.
     move.b  24(a5), MFP_IERA.w
     move.b  25(a5), MFP_IERB.w
@@ -920,6 +951,101 @@ userfw:
     move.w  #5, -(sp)                 ; XBIOS Setscreen
     trap    #14
     lea     12(sp), sp
+    rts
+
+; -------------------------------------------------------------------
+; ufw_ay_apply -- once per VBL: hand the YM to the Spectrum 128's AY (or
+; back), and copy the AY registers from the cart AY block into it.
+;
+; DMA machines: the beeper is DMA sound, so the YM is the AY's alone;
+; when the AY goes idle its three volumes are zeroed once.
+; YM machines: the beeper plays through the YM as a DAC from Timer-B,
+; whose handler relies on reg 8 staying latched between fires. So the AY
+; taking over masks Timer-B (the beeper goes quiet), and giving the YM
+; back restores the boot-time DAC setup -- reg 8 latched last -- before
+; unmasking it.
+;
+; R13 (envelope shape) restarts the envelope whenever it is written, so
+; it is only written when the RP's sequence has moved, or when the AY has
+; just taken the YM. The YM is only touched at IPL 7: its register latch
+; is shared with the Timer-B handler.
+;
+; Clobbers D0-D3/A1/A2. A0 (the Timer-B cursor) is left alone.
+ufw_ay_apply:
+    lea     YM_SELECT.w, a2
+    moveq   #0, d3                        ; d3: force an R13 write
+    tst.w   AY_BLOCK_ADDR                 ; does the RP want the AY on?
+    bne.s   .ay_on
+    tst.b   UFW_AY_ACTIVE                 ; no: give the YM back if ours
+    beq.s   .ay_ret
+    sf      UFW_AY_ACTIVE
+    move.w  sr, -(sp)
+    ori.w   #$0700, sr
+    tst.b   UFW_HAS_DMA
+    bne.s   .ay_mute
+    ; YM machine: the beeper's DAC setup, exactly as at boot.
+    move.b  #YM_REG_MIXER, (a2)
+    move.b  #YM_MIXER_DAC_AB, 2(a2)
+    moveq   #0, d0
+.ay_dac_periods:                          ; R0-R3: tone periods A/B = 0
+    move.b  d0, (a2)
+    move.b  #0, 2(a2)
+    addq.b  #1, d0
+    cmp.b   #4, d0
+    bne.s   .ay_dac_periods
+    move.b  #YM_REG_CHC_VOL, (a2)
+    move.b  #0, 2(a2)                     ; ch C silent
+    move.b  #YM_REG_CHB_VOL, (a2)
+    move.b  #0, 2(a2)
+    move.b  #YM_REG_CHA_VOL, (a2)         ; reg 8 latched last for Timer-B
+    move.b  #0, 2(a2)
+    move.w  (sp)+, sr
+    bset    #0, MFP_IMRA.w                ; beeper (Timer-B) back on
+    rts
+.ay_mute:                                 ; DMA machine: three volumes 0
+    moveq   #YM_REG_CHA_VOL, d0
+.ay_mute_ch:
+    move.b  d0, (a2)
+    move.b  #0, 2(a2)
+    addq.b  #1, d0
+    cmp.b   #YM_REG_CHC_VOL+1, d0
+    bne.s   .ay_mute_ch
+    move.w  (sp)+, sr
+.ay_ret:
+    rts
+
+.ay_on:
+    tst.b   UFW_AY_ACTIVE
+    bne.s   .ay_regs
+    st      UFW_AY_ACTIVE                 ; the AY takes the YM...
+    moveq   #1, d3                        ; ...and starts its envelope
+    tst.b   UFW_HAS_DMA
+    bne.s   .ay_regs
+    bclr    #0, MFP_IMRA.w                ; YM machine: beeper DAC off
+.ay_regs:
+    lea     AY_BLOCK_ADDR+4, a1           ; R0's word
+    move.w  sr, -(sp)
+    ori.w   #$0700, sr
+    moveq   #0, d0
+.ay_reg:                                  ; R0-R12
+    move.b  d0, (a2)                      ; select
+    move.w  (a1)+, d1
+    move.b  d1, 2(a2)                     ; value: the word's low byte
+    addq.b  #1, d0
+    cmp.b   #YM_REG_ENV_SHAPE, d0
+    bne.s   .ay_reg
+    move.w  AY_BLOCK_ADDR+2, d1           ; envelope-shape sequence
+    cmp.w   UFW_AY_R13SEQ, d1
+    bne.s   .ay_r13
+    tst.b   d3
+    beq.s   .ay_regs_done
+.ay_r13:
+    move.w  d1, UFW_AY_R13SEQ
+    move.b  d0, (a2)                      ; d0 = 13
+    move.w  (a1), d1
+    move.b  d1, 2(a2)
+.ay_regs_done:
+    move.w  (sp)+, sr
     rts
 
 ; -------------------------------------------------------------------
