@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.0.0
+
+- **ZX Spectrum 128K** — the 128 runs alongside the 48K: all eight RAM
+  banks, `$7FFD` paging (RAM bank, screen bank, ROM, lock), both 128
+  ROMs and the 128's timing. The menu's **boot** item starts either
+  model from its ROM.
+- **128K snapshots** — `.z80` (versions 1-3, including +2) and both
+  sizes of 128K `.sna` load, and each snapshot starts on the model it was
+  saved from. +2A/+3, Pentagon, SamRam and Timex snapshots, and `.sna`
+  files saved with TR-DOS paged in, are rejected.
+- **AY music on the YM2149** — the 128's AY registers are copied to the
+  ST's own sound chip every frame, rescaled to its clock. On an STE the
+  beeper plays alongside on DMA sound; on a plain ST the beeper is muted
+  while music plays.
+- **Faster screen** — the Spectrum screen is decoded straight into the
+  ST's planar framebuffer, redrawing only rows that changed, which freed
+  96 KB of RP2040 RAM for the 128's memory.
+- **Runs in Hatari** — `make emu` builds MD/Speccy for your computer and
+  runs it in Hatari with [EmuMD](https://github.com/neilrackett/emumd).
+
 ## v1.1.0
 
 - **`.sna` snapshots** — 48K `.sna` files load from the SD app folder
