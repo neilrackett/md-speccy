@@ -78,8 +78,11 @@ extern "C" {
 #define ZX_DISPLAY_HEIGHT (256)
 
 // ZX Spectrum models
+/* MODIFIED (md-speccy): ZX_TYPE_128 restored from upstream chips (zx2040
+   had cut the emulator down to the 48K). */
 typedef enum {
     ZX_TYPE_48K,
+    ZX_TYPE_128,
 } zx_type_t;
 
 // ZX Spectrum joystick types
@@ -105,6 +108,9 @@ typedef struct {
     struct {
         // ZX Spectrum 48K
         chips_range_t zx48k;
+        // ZX Spectrum 128 (MODIFIED (md-speccy): restored from upstream)
+        chips_range_t zx128_0;
+        chips_range_t zx128_1;
     } roms;
     /* MODIFIED (md-speccy port): caller-provided storage for the 1-bit
        beeper sample ring (AUDIOBUF_LEN uint32_t words), injected like
@@ -151,12 +157,19 @@ typedef struct {
     uint64_t pins;
     uint64_t freq_hz;
     bool valid;
-    uint8_t ram[3][0x4000];
-    /* MODIFIED (md-speccy port): the 48K ROM copy was replaced with a
-     * pointer to the ROM image in flash to save 16 KB of RP2040 RAM.
-     * The Z80 never writes ROM, so mapping the const flash array
-     * directly is safe. */
-    const uint8_t* rom0;
+    /* MODIFIED (md-speccy): 8 banks again for the 128 (zx2040 kept 3).
+     * The 48K uses banks 0..2 at $4000/$8000/$C000. */
+    uint8_t ram[8][0x4000];
+    /* MODIFIED (md-speccy port): the ROM copies were replaced with
+     * pointers to the ROM images in flash to save RP2040 RAM. The Z80
+     * never writes ROM, so mapping the const flash arrays directly is
+     * safe. 48K: rom[0] only; 128: rom[0] the editor, rom[1] 48 BASIC. */
+    const uint8_t* rom[2];
+    /* MODIFIED (md-speccy): the 128's AY-3-8912 as a register file only
+     * -- selected register and (masked) contents, so software can read
+     * back what it wrote. No synthesis here. */
+    uint8_t ay_addr;
+    uint8_t ay_regs[16];
 } zx_t;
 
 // initialize a new ZX Spectrum instance
@@ -204,6 +217,7 @@ static void _zx_init_keyboard_matrix(zx_t* sys);
 #define _ZX_DEFAULT(val,def) (((val) != 0) ? (val) : (def))
 
 #define _ZX_48K_FREQUENCY (3500000)
+#define _ZX_128_FREQUENCY (3546894)  /* MODIFIED (md-speccy): restored */
 
 void zx_init(zx_t* sys, const zx_desc_t* desc) {
     CHIPS_ASSERT(sys && desc);
@@ -212,16 +226,31 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     sys->valid = true;
     sys->type = desc->type;
     sys->joystick_type = desc->joystick_type;
-    sys->freq_hz = _ZX_48K_FREQUENCY;
 
     // initalize the hardware
     sys->border_color = 0;
-    CHIPS_ASSERT(desc->roms.zx48k.ptr && (desc->roms.zx48k.size == 0x4000));
-    sys->rom0 = (const uint8_t*) desc->roms.zx48k.ptr;  /* MODIFIED: map flash */
-    sys->display_ram_bank = 0;
-    sys->frame_scan_lines = 312;
-    sys->top_border_scanlines = 64;
-    sys->scanline_period = 224; // This value is modified in zx.c
+    /* MODIFIED (md-speccy): 128 model restored from upstream; ROMs are
+       mapped from flash rather than copied. */
+    if (ZX_TYPE_128 == sys->type) {
+        CHIPS_ASSERT(desc->roms.zx128_0.ptr && (desc->roms.zx128_0.size == 0x4000));
+        CHIPS_ASSERT(desc->roms.zx128_1.ptr && (desc->roms.zx128_1.size == 0x4000));
+        sys->rom[0] = (const uint8_t*) desc->roms.zx128_0.ptr;
+        sys->rom[1] = (const uint8_t*) desc->roms.zx128_1.ptr;
+        sys->freq_hz = _ZX_128_FREQUENCY;
+        sys->display_ram_bank = 5;
+        sys->frame_scan_lines = 311;
+        sys->top_border_scanlines = 63;
+        sys->scanline_period = 228; // This value is modified in zx.c
+    }
+    else {
+        CHIPS_ASSERT(desc->roms.zx48k.ptr && (desc->roms.zx48k.size == 0x4000));
+        sys->rom[0] = (const uint8_t*) desc->roms.zx48k.ptr;
+        sys->freq_hz = _ZX_48K_FREQUENCY;
+        sys->display_ram_bank = 0;
+        sys->frame_scan_lines = 312;
+        sys->top_border_scanlines = 64;
+        sys->scanline_period = 224; // This value is modified in zx.c
+    }
     sys->scanline_counter = sys->scanline_period;
 
     sys->pins = z80_init(&sys->cpu);
@@ -253,9 +282,43 @@ void zx_reset(zx_t* sys) {
     sys->scanline_counter = sys->scanline_period;
     sys->scanline_y = 0;
     sys->blink_counter = 0;
-    sys->display_ram_bank = 0;
+    /* MODIFIED (md-speccy): 128 paging / AY state, as upstream */
+    sys->last_mem_config = 0;
+    sys->ay_addr = 0;
+    memset(sys->ay_regs, 0, sizeof(sys->ay_regs));
+    sys->display_ram_bank = (ZX_TYPE_128 == sys->type) ? 5 : 0;
     _zx_init_memory_map(sys);
 }
+
+/* MODIFIED (md-speccy): restored from upstream. Port $7FFD: bits 0-2 the
+   RAM bank at $C000, bit 3 the screen (bank 5 or 7), bit 4 the ROM, bit
+   5 locks paging until reset. Skips the remap when nothing changes (games
+   often rewrite the same value), and tells the front-end when the
+   displayed bank changes (vram_set_display). */
+static void _zx_update_memory_map_zx128(zx_t* sys, uint8_t config) {
+    const uint8_t changed = sys->last_mem_config ^ config;
+    sys->last_mem_config = config;
+    if (changed & 0x07) {
+        mem_map_ram(&sys->mem, 0, 0xC000, 0x4000, sys->ram[config & 7]);
+    }
+    if (changed & (1<<4)) {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[(config >> 4) & 1]);
+    }
+    if (changed & (1<<3)) {
+        sys->display_ram_bank = (config & (1<<3)) ? 7 : 5;
+        vram_set_display(sys->ram[sys->display_ram_bank]);
+    }
+    if (config & (1<<5)) {
+        sys->memory_paging_disabled = true;
+    }
+}
+
+/* MODIFIED (md-speccy): AY register read-back masks (unused bits read 0),
+   as upstream chips' ay38910.h and Fuse. */
+static const uint8_t _zx_ay_reg_mask[16] = {
+    0xFF, 0x0F, 0xFF, 0x0F, 0xFF, 0x0F, 0x1F, 0xFF,
+    0x1F, 0x1F, 0x1F, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF,
+};
 
 /* MODIFIED (md-speccy): the per-tick path (_zx_tick + zx_exec, with the
    mem.h accessors inlined into them) is compiled -O2 like z80_tick in
@@ -280,8 +343,9 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             sys->blink_counter++;
             // request vblank interrupt
             pins |= Z80_INT;
-            // hold the INT pin for 32 ticks
-            sys->int_counter = 32;
+            // hold the INT pin for 32 ticks (MODIFIED (md-speccy): 36 on
+            // the 128, as on the real machine)
+            sys->int_counter = (ZX_TYPE_128 == sys->type) ? 36 : 32;
         }
     }
 
@@ -337,6 +401,37 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             // Kempston Joystick (........000.....)
             Z80_SET_DATA(pins, sys->kbd_joymask | sys->joy_joymask);
         }
+        /* MODIFIED (md-speccy): the 128's ports, restored from upstream
+           (decoding per http://8bit.yarek.pl/computer/zx.128/). */
+        else if (ZX_TYPE_128 == sys->type) {
+            if ((pins & (Z80_A15|Z80_A1)) == 0) {
+                // memory control $7FFD (0.............0.), write only
+                if ((pins & Z80_WR) && !sys->memory_paging_disabled) {
+                    _zx_update_memory_map_zx128(sys, Z80_GET_DATA(pins));
+                }
+            }
+            else if ((pins & (Z80_A15|Z80_A1)) == Z80_A15) {
+                if (pins & Z80_A14) {
+                    // AY register select / read $FFFD (11............0.)
+                    if (pins & Z80_WR) {
+                        sys->ay_addr = Z80_GET_DATA(pins) & 0x0F;
+                    }
+                    else if (pins & Z80_RD) {
+                        uint8_t data = sys->ay_regs[sys->ay_addr];
+                        if (sys->ay_addr == 14) {
+                            // port A: nothing attached (as Fuse)
+                            data = (sys->ay_regs[7] & 0x40) ? (data & 0xBF) : 0xBF;
+                        }
+                        Z80_SET_DATA(pins, data);
+                    }
+                }
+                else if (pins & Z80_WR) {
+                    // AY register write $BFFD (10............0.)
+                    sys->ay_regs[sys->ay_addr] =
+                        Z80_GET_DATA(pins) & _zx_ay_reg_mask[sys->ay_addr];
+                }
+            }
+        }
     }
 
     return pins;
@@ -350,7 +445,8 @@ uint32_t __not_in_flash_func(zx_exec)(zx_t* sys, uint32_t micro_seconds) {
     CHIPS_ASSERT(sys && sys->valid);
     const uint32_t num_ticks = clk_us_to_ticks(sys->freq_hz, micro_seconds);
     uint64_t pins = sys->pins;
-    const uint32_t last_bitmap_scanline = 64+192;
+    /* MODIFIED (md-speccy): from the model (63 top border lines on the 128) */
+    const uint32_t last_bitmap_scanline = sys->top_border_scanlines + 192;
 
     // Other than the ticks, we have another stop condition, that is to stop
     // only when a final bitmap scanline was reached. This is useful because the
@@ -526,10 +622,21 @@ void zx_joystick(zx_t* sys, uint8_t mask) {
 
 static void _zx_init_memory_map(zx_t* sys) {
     mem_init(&sys->mem);
-    mem_map_ram(&sys->mem, 0, 0x4000, 0x4000, sys->ram[0]);
-    mem_map_ram(&sys->mem, 0, 0x8000, 0x4000, sys->ram[1]);
-    mem_map_ram(&sys->mem, 0, 0xC000, 0x4000, sys->ram[2]);
-    mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom0);  /* MODIFIED: flash ptr */
+    /* MODIFIED (md-speccy): the 128 layout restored from upstream; ROMs
+       are flash pointers; the front-end is told which bank is the screen. */
+    if (ZX_TYPE_128 == sys->type) {
+        mem_map_ram(&sys->mem, 0, 0x4000, 0x4000, sys->ram[5]);
+        mem_map_ram(&sys->mem, 0, 0x8000, 0x4000, sys->ram[2]);
+        mem_map_ram(&sys->mem, 0, 0xC000, 0x4000, sys->ram[0]);
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[0]);
+    }
+    else {
+        mem_map_ram(&sys->mem, 0, 0x4000, 0x4000, sys->ram[0]);
+        mem_map_ram(&sys->mem, 0, 0x8000, 0x4000, sys->ram[1]);
+        mem_map_ram(&sys->mem, 0, 0xC000, 0x4000, sys->ram[2]);
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[0]);
+    }
+    vram_set_display(sys->ram[sys->display_ram_bank]);
 }
 
 static void _zx_init_keyboard_matrix(zx_t* sys) {

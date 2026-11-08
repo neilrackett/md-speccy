@@ -165,20 +165,18 @@ static inline void mem_wr(mem_t* mem, uint16_t addr, uint8_t data) {
     // performances as certain big SPI displays take too much time for
     // a full refresh. At the same time, at each zx_exec() call, the
     // Spectrum program is hardly able to update all the screen.
-    if (addr >= 0x4000 && addr <= 0x57ff) {
-        if (data !=
-        mem->page_table[addr>>MEM_PAGE_SHIFT].write_ptr[addr & MEM_PAGE_MASK])
-        {
-            vram_set_dirty_bitmap(addr);
-        }
-    } else if (addr >= 0x5800 && addr <= 0x5aff) {
-        if (data !=
-        mem->page_table[addr>>MEM_PAGE_SHIFT].write_ptr[addr & MEM_PAGE_MASK])
-        {
-            vram_set_dirty_attr(addr);
-        }
+    /* MODIFIED (md-speccy): keyed on the host address within the
+       displayed screen bank (vram_base, kept by the front-end) rather
+       than on Z80 $4000-$5AFF, so 128 writes reach the screen through
+       $C000 too, and writes to the hidden screen are ignored. The
+       offset passed on is within the 6912-byte display file. */
+    uint8_t* p = &mem->page_table[addr>>MEM_PAGE_SHIFT].write_ptr[addr & MEM_PAGE_MASK];
+    const uintptr_t off = (uintptr_t)p - (uintptr_t)vram_base;
+    if (off < 0x1B00 && data != *p) {
+        if (off < 0x1800) vram_set_dirty_bitmap((uint16_t)off);
+        else              vram_set_dirty_attr((uint16_t)off);
     }
-    mem->page_table[addr>>MEM_PAGE_SHIFT].write_ptr[addr & MEM_PAGE_MASK] = data;
+    *p = data;
 }
 /* helper method to write a 16-bit value, does 2 mem_wr() */
 static inline void mem_wr16(mem_t* mem, uint16_t addr, uint16_t data) {

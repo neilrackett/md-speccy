@@ -31,9 +31,11 @@ author. (Also: no `Co-Authored-By` trailers at all, per the repo owner.)
 
 ## What this repo is
 
-**MD/Speccy** — a **ZX Spectrum 48K emulator** for the Atari ST / STE /
-MegaST(E), built on the SidecarTridge Multi-device **framebuffer
-template**. It is a port of [zx2040](https://github.com/antirez/zx2040)
+**MD/Speccy** — a **ZX Spectrum 48K / 128K emulator** for the Atari ST /
+STE / MegaST(E), built on the SidecarTridge Multi-device **framebuffer
+template**. (128K status: the model runs — banks, paging, ROMs, AY
+register file — and boots from the menu's `boot` item; 128K snapshots
+and AY sound on the YM are not done yet.) It is a port of [zx2040](https://github.com/antirez/zx2040)
 (Salvatore Sanfilippo's RP2040 port of Andre Weissflog's `chips`
 emulator). The Spectrum runs entirely on the RP2040 in the cartridge; the
 ST is the screen, keyboard and speaker.
@@ -376,6 +378,38 @@ runs the job worker and the audio refill timer.**
 | PWM beeper on Core 1 | `zxemu_audio_fill` → STE DMA PCM or YM, refilled from a Core 1 timer |
 | flash game blob | FatFs enum of `/speccy`, `.z80` via `zx_load_z80`, `.sna` via `zx_load_sna` (both stream from the file) |
 
+### The 128K model
+
+zx2040 had cut chips' `zx.h` down to the 48K; the 128 parts are restored
+from upstream (all marked `MODIFIED (md-speccy)`): `ZX_TYPE_128`,
+`zx_t.ram[8][0x4000]` (the 48K uses banks 0-2 at `$4000/$8000/$C000`;
+the 128 maps 5/2/0), both 128 ROMs as flash pointers (`zx_t.rom[2]`),
+3,546,894 Hz, 311 lines / 63 top-border lines, a 36 T interrupt, and the
+ports: `$7FFD` (`(A15|A1)==0`, write: RAM bank at `$C000`, screen bank 5
+or 7, ROM, lock) and the AY at `$FFFD` (select / read) and `$BFFD`
+(write). `_zx_update_memory_map_zx128` only remaps what changed (games
+rewrite the same `$7FFD` value a lot; a remap is 16 page-table entries).
+**The AY is a register file only** — `ay_addr` + `ay_regs[16]`, masked on
+write as upstream / Fuse, port A reads `$BF` in input mode — so software
+reads back what it wrote; nothing is synthesised and nothing reaches the
+ST's YM yet. `zx_exec` stops at `top_border_scanlines + 192`.
+
+Model selection: `zx_start(type)` in `zxemu.c` cold-starts a model
+(`zx_init` wipes the machine, so it re-registers the extra key codes,
+keeps the menu's `scan-p`, and carries the beeper ring indices across the
+wipe for the Core 1 fill, which reads `zx_audiobuf_store` directly). The
+menu's `boot` item (left/right: 48K/128K, fire: cold start) calls it;
+power-on is the 48K. Loaders call `zx_prepare_model()` after validating
+a file and before writing RAM, so a 48K snapshot on a running 128 gets a
+real 48K. Note `scan-p` (default 150), not the model, sets T-states per
+emulated frame, so the 128 costs the same per frame as the 48K.
+
+Validated offline on the host build of the core: a Z80 program on the
+128 checks banking through `$C000`, the lock, the ROM switch, the dirty
+hook (only displayed-bank writes, screen switches reported) and AY
+read-back; both ROMs boot (48K copyright screen; the 128 menu, 128 BASIC
+and 48 BASIC from it, which pages ROM 1 and locks paging).
+
 ### Display decode (validated offline)
 
 `update_display()` (in `zxemu.c`, `__not_in_flash_func`, `-O2` region)
@@ -391,6 +425,13 @@ correct. **Anything that touches VRAM behind the hooks must call
 the menu/About overlay draw *and* its restore, `load_game()` (snapshots
 write VRAM directly), and `init_emulator()`. Missing one shows up as
 stale screen regions.
+
+The hook in `mem.h` is keyed on the **host address within the displayed
+screen bank** (`vram_base`), not on Z80 `$4000-$5AFF`: on the 128 the
+screen can be written through `$C000`, and bank 7 can be the screen.
+`vram_set_dirty_*` take the offset in the display file. `zx.h` calls
+`vram_set_display()` whenever the displayed bank changes (machine start,
+`$7FFD` bit 3), which updates `vram_base` and forces a full repaint.
 
 Per row (bottom-up — see the framebuffer pipeline) it reads the Spectrum
 bitmap byte at `((py&0xC0)<<5)|((py&0x07)<<8)|((py&0x38)<<2)|(px>>3)` and
@@ -532,11 +573,11 @@ file any more — input is the direct mapping described above.)
 
 ### RAM budget — CRITICAL, read before adding statics
 
-The 48 KB Spectrum RAM (`zx_t.ram[3][0x4000]`) is irreducible, and the
-22 KB Z80 decoder is pinned into RAM as well. `.bss`+heap must not cross
-`0x20030000`. Since the framebuffer pipeline stopped using RP RAM (no
-chunky buffer, no planar scratch) the heap window is ~105 KB — the room a
-128K machine's extra 80 KB of banks would need.
+The 128 KB of Spectrum RAM (`zx_t.ram[8][0x4000]`, all eight banks,
+resident) is irreducible, and the 22 KB Z80 decoder is pinned into RAM as
+well. `.bss`+heap must not cross `0x20030000`. It fits because the
+framebuffer pipeline stopped using RP RAM (no chunky buffer, no planar
+scratch: 96 KB).
 
 **The heap floor is ~9.5 KB — an overflow here does NOT fail the link.**
 The boot-time settings library mallocs a **4 KB buffer each for gconfig
@@ -551,7 +592,7 @@ If a boot-time malloc fails, `gconfig_init`/`aconfig_init` fail and
 `main.c` **jumps to Booster** — the symptom is "app launches then lands
 straight back in Booster", which looks like a crash but is a deliberate
 bail. Check heap after every RAM change: `0x20030000 - __bss_end__` in
-the `.map` (currently 107,616 B release / 107,320 B debug).
+the `.map` (currently 25,260 B release / 24,948 B debug).
 
 **Byte arithmetic is not enough**: newlib's full malloc grows the heap
 in **page-rounded (4 KB) sbrk steps**, so without countermeasures a
@@ -610,8 +651,9 @@ Diagnose overflow with the linker `.map` (`rp/build-*/rp.elf.map`), not
 by estimating: `--gc-sections` drops unused statics, and non-`const`
 arrays silently land in `.data` RAM. `arm-none-eabi-size rp.elf` shows
 the totals. A host `sizeof` probe over `rp/src/zx/*.h` (define
-`SPEAKER_PIN`, stub `vram_set_dirty_*`) gives struct sizes; `zx_t` is
-~56.7 KB.
+`SPEAKER_PIN`, stub `vram_set_dirty_*`, `vram_set_display`, `vram_base`)
+gives struct sizes (a 64-bit host inflates the page-table pointers: 137,600
+B there); on target the whole `EMU` (mostly `zx_t`) is 135,128 B.
 
 ### Frame pacing
 

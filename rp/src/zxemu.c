@@ -26,10 +26,14 @@
 
 #include "device_config.h" // Audio / display metrics.
 
-// VRAM update tracking function, this is used inside mem.h.
-void vram_set_dirty_bitmap(uint16_t addr);
-void vram_set_dirty_attr(uint16_t addr);
+// VRAM update tracking, used inside mem.h / zx.h: the write hook compares
+// against vram_base (the displayed screen bank) and passes the offset in
+// the display file; zx.h reports screen-bank changes via vram_set_display.
+extern const uint8_t *vram_base;
+void vram_set_dirty_bitmap(uint16_t off);
+void vram_set_dirty_attr(uint16_t off);
 void vram_force_dirty(void);
+void vram_set_display(const uint8_t *bank);
 
 #define CHIPS_IMPL
 #include "chips_common.h"
@@ -101,6 +105,9 @@ static uint32_t zxpalette[16] = {
 };
 
 void load_game(int game_id);
+void flush_zx_key_press(zx_t *zx);
+static void zx_start(zx_type_t type);
+static void zx_prepare_model(zx_type_t type);
 
 /* =============================== Games list =============================== */
 
@@ -207,6 +214,10 @@ struct emustate {
     // Spectrum cursor keys / Caps Shift+5-8 (1). Toggled from the menu.
     uint32_t cursor_as_keys;
 
+    // Model the menu's "boot" item cold-starts (a zx_type_t). Snapshots
+    // pick their own model when loaded.
+    uint32_t boot_model;
+
     // Is the game selection / config menu shown?
     int menu_active;
     int about_active;           // "About" pop-over shown (modal over the menu).
@@ -269,11 +280,14 @@ static inline uint32_t zx_frame_usec(void) {
 #define UI_EVENT_PARTIAL 8      // Display partial update toggled.
 #define UI_EVENT_EXIT 9         // "Exit" action item selected.
 #define UI_EVENT_ABOUT 10       // "About" action item selected.
+#define UI_EVENT_BOOT 11        // "boot" item selected: cold start a model.
 #define UI_EVENT_NAVIGATION 254 // Just moving around in the menu.
 #define UI_EVENT_DISMISS 255    // Menu dismissed.
 
 const uint32_t CursorValues[] = {0, 1};
 const char *CursorValuesNames[] = {"stick", "keys", NULL};
+const uint32_t ModelValues[] = {ZX_TYPE_48K, ZX_TYPE_128};
+const char *ModelValuesNames[] = {"48K", "128K", NULL};
 struct UISettingsItem {
     uint32_t event;     // Event reported if setting is changed.
     const char *name;   // Name of the setting.
@@ -297,6 +311,9 @@ struct UISettingsItem {
         "cursor", &EMU.cursor_as_keys, 1, 0, 1, CursorValues, CursorValuesNames},
     {UI_EVENT_NONE,
         "scan-p", (uint32_t*)&EMU.zx.scanline_period, 1, 10, 500, NULL, NULL},
+    // Left/right picks the model, fire cold-starts it from ROM.
+    {UI_EVENT_BOOT,
+        "boot", &EMU.boot_model, 1, 0, 1, ModelValues, ModelValuesNames},
     {UI_EVENT_ABOUT,
         "about", NULL, 0, 0, 0, NULL, NULL},
     {UI_EVENT_EXIT,
@@ -464,6 +481,13 @@ static void ui_menu_select(void) {
         struct UISettingsItem *si = &SettingsList[-EMU.selected_game - 1];
         if (si->event == UI_EVENT_EXIT) ikbd_request_boot_gem();
         else if (si->event == UI_EVENT_ABOUT) EMU.about_active = 1;
+        else if (si->event == UI_EVENT_BOOT) {
+            flush_zx_key_press(&EMU.zx);
+            zx_start((zx_type_t)EMU.boot_model);
+            EMU.loaded_game = -1;
+            EMU.menu_active = 0;
+            EMU.menu_left_at_tick = EMU.tick;
+        }
     }
 }
 
@@ -537,7 +561,7 @@ void ui_draw_menu(void) {
 static const char *AboutLines[] = {
     "MD/Speccy " RELEASE_VERSION,
     "",
-    "ZX Spectrum 48K emulator",
+    "ZX Spectrum 48K/128K",
     "by Neil Rackett",
     "neilrackett.com/atarist",
     "",
@@ -602,19 +626,23 @@ void ui_draw_about(void) {
 
 /* =========================== Emulator implementation ====================== */
 
+// The displayed screen bank, for the mem.h write hook (set by zx.h through
+// vram_set_display whenever the screen bank changes or the machine starts).
+const uint8_t *vram_base;
+
 // Set a bitmap signaling which part of the screen RAM was touched and
-// is yet to be updated on the display. This function is called when the
-// address 'addr' is in the range of the VRAM bitmap area.
-void __not_in_flash_func(vram_set_dirty_bitmap)(uint16_t addr) {
-    uint16_t y = ((addr&0x1800)>>5) | ((addr&0x700)>>8) | ((addr&0xe0)>>2);
+// is yet to be updated on the display. This function is called when
+// 'off' (offset in the display file) is in the bitmap area.
+void __not_in_flash_func(vram_set_dirty_bitmap)(uint16_t off) {
+    uint16_t y = ((off&0x1800)>>5) | ((off&0x700)>>8) | ((off&0xe0)>>2);
     EMU.dirty_vram[y>>3] |= 1 << (y&7);
 }
 
-// Like vram_set_dirty_bitmap() but called for addresses in the range
+// Like vram_set_dirty_bitmap() but called for offsets in the range
 // of the color attributes.
-void __not_in_flash_func(vram_set_dirty_attr)(uint16_t addr) {
+void __not_in_flash_func(vram_set_dirty_attr)(uint16_t off) {
     // Mark all the 8 rows affected in one operation.
-    EMU.dirty_vram[((addr-0x5800)>>5) & 31] = 0xff;
+    EMU.dirty_vram[((off-0x1800)>>5) & 31] = 0xff;
 }
 
 // Clean the bitmap of modified scanlines.
@@ -628,6 +656,13 @@ void vram_reset_dirty(void) {
 void vram_force_dirty(void) {
     memset(EMU.dirty_vram,0xff,sizeof(EMU.dirty_vram));
     EMU.last_update_border_color = 0xff; // Impossible color: update forced.
+}
+
+// zx.h: the displayed screen bank is now `bank` (machine start, or the
+// 128 switching between banks 5 and 7). Everything on screen changes.
+void vram_set_display(const uint8_t *bank) {
+    vram_base = bank;
+    vram_force_dirty();
 }
 
 // ZX Spectrum palette to RGB565 conversion. We do it at startup to avoid
@@ -871,7 +906,8 @@ static bool zx_z80_unpack(zx_reader_t *r, uint8_t *dst, uint32_t cap,
 // flags0 bit 5 is set), versions 2/3 (PC = 0 in the main header) with an
 // extended header and then one block per 16 KB page -- page 8 is $4000,
 // 4 is $8000, 5 is $C000; others are skipped. A block length of 0xFFFF
-// means 16 KB stored raw. 128K images (hardware mode >= 3) are rejected
+// means 16 KB stored raw. A running 128 is restarted as a 48K first.
+// 128K images (hardware mode >= 3) are not loaded yet; they are rejected
 // before anything is written, leaving the running machine untouched.
 // Registers are set as upstream's zx_quickload() sets them.
 static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
@@ -894,6 +930,7 @@ static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
         if (ext.hw_mode >= 3) return false;
         pc = (uint16_t)((ext.PC_h << 8) | ext.PC_l);
     }
+    zx_prepare_model(ZX_TYPE_48K);
 
     if (v1) {
         uint8_t *mem = sys->ram[0];            // ram[0..2]: $4000-$FFFF
@@ -940,10 +977,11 @@ static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
 // Load a 48K .sna snapshot: a 27-byte register header followed by a raw
 // 48 KB dump of $4000-$FFFF (no compression). PC is not in the header --
 // the save pushed it onto the stack, so loading emulates RETN: pop PC,
-// SP += 2, IFF2 -> IFF1. 128K .sna images are a different size and are
-// rejected (this is a 48K machine).
+// SP += 2, IFF2 -> IFF1. A running 128 is restarted as a 48K first. 128K
+// .sna images are a different size and are not loaded yet.
 static bool zx_load_sna(zx_t *sys, zx_reader_t *r, uint32_t size) {
     if (size != 27 + 0xC000) return false;
+    zx_prepare_model(ZX_TYPE_48K);
     uint8_t h[27];
     if (!zx_rd(r, h, sizeof(h)) ||
         !zx_rd(r, sys->ram[0], 0x4000) ||           // $4000
@@ -1059,15 +1097,40 @@ void init_emulator(void) {
     // Publish the ZX Spectrum palette to the Atari ST shifter.
     zx_set_palette();
 
-    // Emulator core: 48K, Kempston joystick.
+    // Emulator core: the 48K at power-on (the menu's boot item starts a
+    // 128; snapshots pick their own model).
+    EMU.boot_model = ZX_TYPE_48K;
+    zx_start(ZX_TYPE_48K);
+}
+
+// Cold-start the Spectrum as `type`, Kempston joystick. zx_init() wipes
+// the whole machine, so this also re-registers our extra key codes and
+// keeps the menu's scan-p value (ZX_DEFAULT_SCANLINE_PERIOD the first
+// time).
+//
+// The Core 1 audio fill reads the beeper ring indices concurrently and
+// relies on them only moving forward, so they are carried across the
+// wipe (the ring itself is zx_audiobuf_store, outside zx_t). A fill that
+// lands mid-wipe sees zero indices for one buffer -- a glitch at a reset.
+static void zx_start(zx_type_t type) {
+    const int scanline_period = EMU.zx.scanline_period;
+    const uint32_t ab_byte = EMU.zx.audiobuf_byte, ab_bit = EMU.zx.audiobuf_bit;
+
     zx_desc_t zx_desc = {0};
-    zx_desc.type = ZX_TYPE_48K;
+    zx_desc.type = type;
     zx_desc.joystick_type = ZX_JOYSTICKTYPE_KEMPSTON;
     zx_desc.roms.zx48k.ptr = (void *)dump_amstrad_zx48k_bin;
     zx_desc.roms.zx48k.size = sizeof(dump_amstrad_zx48k_bin);
+    zx_desc.roms.zx128_0.ptr = (void *)dump_amstrad_zx128k_0_bin;
+    zx_desc.roms.zx128_0.size = sizeof(dump_amstrad_zx128k_0_bin);
+    zx_desc.roms.zx128_1.ptr = (void *)dump_amstrad_zx128k_1_bin;
+    zx_desc.roms.zx128_1.size = sizeof(dump_amstrad_zx128k_1_bin);
     zx_desc.audiobuf = zx_audiobuf_store;
     zx_init(&EMU.zx, &zx_desc);
-    EMU.zx.scanline_period = ZX_DEFAULT_SCANLINE_PERIOD;
+    EMU.zx.audiobuf_byte = ab_byte;
+    EMU.zx.audiobuf_bit = ab_bit;
+    EMU.zx.scanline_period =
+        scanline_period ? scanline_period : ZX_DEFAULT_SCANLINE_PERIOD;
 
     // Register a standalone Caps Shift key at (column 0, line 0). Upstream
     // registers it only as a modifier; the full-keyboard mapping needs to
@@ -1078,6 +1141,13 @@ void init_emulator(void) {
     // one at the '2' cell (column 3, line 1) with the Caps Shift modifier
     // (mod 0), so pressing it holds both cells at once.
     kbd_register_key(&EMU.zx.kbd, ZX_KEY_CAPSLK, 3, 1, 1);
+}
+
+// Snapshot loaders call this once the file has been validated, before
+// they write any RAM: a snapshot for another model restarts the machine
+// as that model (a 48K one on a running 128 gets a real 48K).
+static void zx_prepare_model(zx_type_t type) {
+    if (EMU.zx.type != type) zx_start(type);
 }
 
 /* Load the specified game ID (index into GamesTable). */
@@ -1370,7 +1440,7 @@ void zxemu_audio_fill(uint8_t *buf, uint32_t bytes) {
         const uint32_t n = end - taken;
         uint32_t ones = 0;
         for (; taken < end; taken++) {
-            ones += (EMU.zx.audiobuf[(idx >> 5) & (AUDIOBUF_LEN - 1)]
+            ones += (zx_audiobuf_store[(idx >> 5) & (AUDIOBUF_LEN - 1)]
                      >> (idx & 31)) & 1u;
             idx++;
         }
