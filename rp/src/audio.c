@@ -23,13 +23,13 @@
 #include "debug.h"
 #include "ff.h"
 #include "commemul.h"
-#include "fb_chunked.h"
+#include "fb_core1.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
 
 /* Per-VBL fill cadence. The gate only exists to reject re-entry from a
  * main loop that spins faster than the VBL; it must never skip a fill
- * in a VBL-locked loop (every fb app blocks on fb_publish). The ST PAL
+ * in a VBL-locked loop (every fb app blocks on fb_wait_vbl). The ST PAL
  * VBL is ~20,032 us, so the old 20,000 us threshold left ~30 us of
  * margin -- one jittery time_us_32() reading skipped a fill, and the
  * m68k then replayed the previous 224 B buffer for a whole frame while

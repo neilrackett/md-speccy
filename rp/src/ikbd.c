@@ -114,7 +114,7 @@ void ikbd_clear_command(void) {
    * boot. Left set, a BOOT_GEM from an exit persists across an ST reset:
    * the re-run userfw re-reads it and quits to GEM instead of running.
    * Called once per main-loop iteration -- BOOT_GEM survives the single
-   * frame between the exit write and userfw's VBL read (fb_publish
+   * frame between the exit write and userfw's VBL read (fb_wait_vbl
    * blocks until that read), then this wipes it. */
   *((volatile uint32_t *)((uintptr_t)&__rom_in_ram_start__ +
                           CART_CMD_SENTINEL_OFFSET)) =

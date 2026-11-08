@@ -90,14 +90,14 @@ void emul_start() {
     panic("init_romemul failed");
   }
 
-  // ROM3 cart-bus capture ring (PIO + DMA) BEFORE fb_init, whose first
-  // fb_publish() drains it while waiting for the m68k VBL ack.
+  // ROM3 cart-bus capture ring (PIO + DMA). fb_wait_vbl() drains it
+  // while waiting for the m68k VBL ack.
   if (commemul_init() < 0) {
     panic("commemul_init failed");
   }
 
-  // 320x200 4bpp framebuffer + fb_screen for the draw primitives.
-  // (This launches Core 1 for the chunky->planar worker.)
+  // 320x200 4bpp cart framebuffer (fb_screen). This also launches the
+  // Core 1 job worker that the audio refill timer is started on.
   if (fb_init(&fb_mode_320x200) < 0) {
     panic("fb_init failed");
   }
@@ -144,8 +144,8 @@ void emul_start() {
   //   1. Drain the ROM3 ring -> IKBD demux + VBL frame-sync.
   //   2. Run the IKBD demux.
   //   3. Forward decoded key events to the emulator (button mapping).
-  //   4. Render one Spectrum frame into the framebuffer (blocks on VBL).
-  //   5. Refill the YM audio buffer.
+  //   4. Run one Spectrum frame and decode it into the cart framebuffer
+  //      (blocks on VBL). Audio is refilled by the Core 1 timer.
   DPRINTF("Entering main loop\n");
   while (true) {
     ikbd_clear_command();

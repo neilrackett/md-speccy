@@ -28,8 +28,8 @@ extern "C" {
  * Call after fb_init() / palette_init() / SD mount in emul_start(). */
 void zxemu_init(void);
 
-/* Render one Spectrum frame into the framebuffer and publish it
- * (blocks on the ST VBL via fb_publish, pacing the loop to 50 Hz).
+/* Run one Spectrum frame and decode it into the cart framebuffer
+ * (blocks on the ST VBL via fb_wait_vbl, pacing the loop to 50 Hz).
  * Call once per main-loop iteration. */
 void zxemu_render_frame(void);
 

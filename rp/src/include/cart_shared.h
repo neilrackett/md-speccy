@@ -148,19 +148,14 @@
  * Chunks DO NOT align with scanlines (LCM(48, 160) = 480), so this
  * is not a simple row reversal -- each m68k chunk covers exactly
  * scanline (112 pixels at 4 bpp) and may span row boundaries. The
- * RP-side c2p (rp/src/fb_chunked_asm.S + fb_chunked.c) is responsible
- * for emitting the reversed layout. The simplest implementation is
- * to keep c2p's natural row-major output going to a 32 KB scratch
- * buffer in RP RAM, then do a chunk-reversed memcpy from scratch to
- * the cart FB once both cores finish (~120 us / frame, well under
- * fb_render_frame's main-loop budget). Per-byte address arithmetic
- * inside the c2p hot path is also possible but more invasive.
+ * RP writes the reversed layout directly, a 16-pixel group (8 bytes,
+ * which never straddles a chunk) at a time, through fb_cursor_t in
+ * fb.h -- there is no planar staging copy.
  *
  * Cost / benefit:
  *   - m68k saves ~4 cyc/iter * 571 iters = ~2284 cyc / VBL (~285 us)
  *   - m68k boot adds one `lea (FB_CHUNK_COVERED)(a5), a5` per VBL (~12 cyc)
- *   - RP adds ~120 us / frame for the scratch->cart-FB reverse memcpy
- *   - Net: ~285 us VBL slack reclaimed on the m68k side
+ *   - RP: a chunk-boundary check per group in fb_cursor_put
  */
 #define CART_FB_CHUNK_BYTES           48   /* size of one m68k MOVEM-burst group (12 longwords; A0 and A7 omitted -- A0 is the dedicated Timer-B audio pointer, A7 is the SP) */
 #define CART_FB_BLIT_LINES            200  /* must match FB_COPY_LINES in target/atarist/src/userfw.s */

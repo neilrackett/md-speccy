@@ -7,16 +7,17 @@
  * the shared region (`$FA8300`, 32 KB, 320x200x4bpp). Double-buffering
  * happens on the ST side; the RP just writes into this one buffer.
  *
- * This header is introduced alongside fb_font.* and
- * fb_draw.* so the ported font/draw modules have a stable target
- * type. fb.c defines `fb_screen` and provides
- * the init / clear / address-accessor entry points.
+ * The RP writes ST planar data straight into it (no chunky buffer, no
+ * planar scratch copy): call fb_wait_vbl(), then write through an
+ * fb_cursor_t, bottom rows first (see fb_wait_vbl for why).
  */
 
 #ifndef FB_H
 #define FB_H
 
 #include <stdint.h>
+
+#include "cart_shared.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,8 +31,7 @@ struct FB_MODE {
 
 /* Mirrors md-sprites-demo's VGA_SCREEN but with a single framebuffer
  * pointer instead of A/B/current/hidden (we don't keep a back buffer in
- * cartridge). The ported text renderer writes into
- * `framebuffer` directly. */
+ * cartridge). */
 struct FB_SCREEN {
   unsigned int *framebuffer;
   uint16_t width;
@@ -46,63 +46,94 @@ extern struct FB_SCREEN fb_screen;
 extern const struct FB_MODE fb_mode_320x200;
 
 /**
- * @brief Populate `fb_screen` from a mode descriptor, build the pixel
- *        mask LUT used by the text/draw primitives, and zero the
- *        framebuffer.
+ * @brief Populate `fb_screen` from a mode descriptor and launch the
+ *        Core 1 job worker (fb_core1.h).
  *
  * @return 0 on success, -1 if `mode` is NULL.
  */
 int fb_init(const struct FB_MODE *mode);
 
-/** @brief Fill the cartridge framebuffer with 0xFF (solid black in
- *         the default TOS low-res palette). */
+/** @brief Fill the cartridge framebuffer with 0xFF (palette index 15
+ *         everywhere). */
 void fb_clear(void);
 
-/** @brief Render the static parts of the template's boot UI (centered
- *         title + ESC hint). Called once by fb_init; the dynamic parts
- *         live in fb_render_frame. */
-void fb_render_static(void);
-
-/** @brief Render the dynamic parts of the template's boot UI: erase
- *         and redraw only the frame-counter row and the marquee row.
- *         Static title is left intact so we don't churn the parts of
- *         the FB the m68k is currently reading. Safe to call from the
- *         main loop at any cadence. */
-void fb_render_frame(void);
-
-/** @brief Publish the current chunked buffer to the cart framebuffer,
- *         synchronized to the Atari's 50 Hz VBL, tear-free.
+/** @brief Block until the m68k has finished copying the cart
+ *         framebuffer to the ST screen (its VBLSYNC ack, a cart-bus read
+ *         at $FB8400), pacing the caller to the 50 Hz VBL.
  *
- *         Three steps: (1) transpose chunked -> planar SCRATCH (RP RAM,
- *         the slow ~1 ms part) -- this overlaps the m68k's blit of the
- *         previous frame since it doesn't touch the cart FB; (2) BLOCK
- *         until the m68k acks it finished that blit (a cart-bus read at
- *         $FB8400 captured by commemul) so the cart FB is free; (3) do
- *         the fast ~120 us chunk-reversed copy scratch -> cart FB and
- *         bump FB_FRAME_COUNTER.
- *
- *         Because only the short copy in step 3 writes the cart FB, and
- *         it runs in the m68k's post-blit slack, the RP never writes
- *         the FB while the m68k reads it -- no tearing, full 50 Hz. A
- *         ~60 ms timeout (safety net for "m68k not running", e.g. at
- *         boot) keeps the RP from hanging. Drawing into
- *         `fb_chunked_buffer` (RP RAM) is unsynchronized; call this
- *         once per frame after drawing. */
-void fb_publish(void);
+ *         On return the cart FB is free: the m68k is idle until the next
+ *         VBL. Its next blit then reads the cart FB from offset 0 upward
+ *         over most of the frame, and cart offset 0 holds the image's
+ *         BOTTOM chunk (the chunks are reversed), so it copies the image
+ *         bottom-up. Writing bottom rows first keeps the RP ahead of it
+ *         even when the writes run past the VBL. A ~60 ms timeout (safety
+ *         net for "m68k not running", e.g. at boot) keeps the RP from
+ *         hanging. The ROM3 ring is drained while waiting, so IKBD stays
+ *         live. */
+void fb_wait_vbl(void);
 
 /** @brief Drain the ROM3 commemul ring once, routing each captured
- *         sample to BOTH the IKBD demux and the VBL frame-sync
- *         detector. Call from the main loop in place of a bare
- *         commemul_poll(); fb_publish() also calls it internally while
- *         waiting for the VBL ack, so IKBD/ESC stay responsive during
- *         the wait. */
+ *         sample to the IKBD demux, the VBL frame-sync detector and the
+ *         audio report windows. Call from the main loop in place of a
+ *         bare commemul_poll(); fb_wait_vbl() also calls it while
+ *         waiting. */
 void fb_pump_rom3(void);
 
-/** @brief Microseconds the most recent fb_publish() spent in the
- *         chunky-to-planar conversion (dual-core c2p + chunk-reversed
- *         memcpy). Updated every fb_publish(); stale-by-one is fine
- *         for an on-screen timing readout. */
-uint32_t fb_last_convert_us(void);
+/* ---------------------------------------------------------------------
+ * Cart-FB write cursor over consecutive 16-pixel groups.
+ *
+ * The image is ST low-res planar: byte offset `row * 160 + group * 8`,
+ * then one word per plane, plane 0 first. In the cart FB its 48-byte
+ * chunks are stored in reverse order for the m68k's predec MOVEM blit,
+ * with the last CART_FB_CHUNK_TAIL bytes in natural order -- see
+ * "Framebuffer chunk layout for the m68k MOVEM blit" in cart_shared.h.
+ * A group (8 bytes) never straddles a chunk (8 divides 48 and 160), so
+ * the cursor writes whole groups and only re-aims at a chunk boundary,
+ * where the next image chunk sits 48 bytes *below* the current one.
+ *
+ * Each group is written as two 32-bit stores: `lo` = plane 0 | plane 1
+ * << 16 and `hi` = plane 2 | plane 3 << 16, each plane a uint16 whose
+ * bit 15 is the leftmost pixel. The cart bus presents each uint16 as
+ * the ST's big-endian word, so no byte swapping is needed.
+ * ------------------------------------------------------------------- */
+typedef struct {
+  uint32_t *p;   /* cart-FB address of the next group */
+  uint32_t o;    /* its image byte offset */
+  uint32_t left; /* groups left in the current chunk, this one included */
+} fb_cursor_t;
+
+/* Aim the cursor at image byte offset `o` (a multiple of 8). */
+static inline void fb_cursor_seek(fb_cursor_t *c, uint32_t o) {
+  uint8_t *fb = (uint8_t *)fb_screen.framebuffer;
+  c->o = o;
+  if (o >= CART_FB_CHUNK_COVERED) {  // natural-order tail
+    c->p = (uint32_t *)(fb + o);
+    c->left = UINT32_MAX;
+    return;
+  }
+  const uint32_t k = o / CART_FB_CHUNK_BYTES;
+  const uint32_t w = o - k * CART_FB_CHUNK_BYTES;
+  c->p = (uint32_t *)(fb + (CART_FB_CHUNK_COUNT - 1u - k) *
+                               CART_FB_CHUNK_BYTES + w);
+  c->left = (CART_FB_CHUNK_BYTES - w) / 8u;
+}
+
+/* Write one 16-pixel group and advance to the next one in image order. */
+static inline void fb_cursor_put(fb_cursor_t *c, uint32_t lo, uint32_t hi) {
+  c->p[0] = lo;
+  c->p[1] = hi;
+  c->o += 8u;
+  if (--c->left) {
+    c->p += 2;
+  } else if (c->o < CART_FB_CHUNK_COVERED) {
+    // Just wrote the chunk's last group (at +40); the next image chunk
+    // starts 48 bytes before this chunk's start.
+    c->p -= (40u + CART_FB_CHUNK_BYTES) / 4u;
+    c->left = CART_FB_CHUNK_BYTES / 8u;
+  } else {
+    fb_cursor_seek(c, c->o);
+  }
+}
 
 #ifdef __cplusplus
 }

@@ -97,9 +97,8 @@ _conterm			equ $484	; Conterm device number
 ; Constants needed for the commands
 RANDOM_TOKEN_ADDR:        equ (CMD_MAGIC_SENTINEL_ADDR + 4)  ; $FA4004
 RANDOM_TOKEN_SEED_ADDR:   equ (RANDOM_TOKEN_ADDR + 4)        ; $FA4008
-; $FA400C: Framebuffer dirty-frame counter. RP increments it after
-; every fb_render_frame() (with a memory barrier); userfw.s reads it
-; each VBL and skips the cart->ST blit + video flip when unchanged.
+; $FA400C: Framebuffer dirty-frame counter slot. Unused (the blit runs
+; every VBL); kept so the shared-region layout doesn't move.
 FB_FRAME_COUNTER_ADDR:    equ (RANDOM_TOKEN_SEED_ADDR + 4)   ; $FA400C
 RANDOM_TOKEN_POST_WAIT:   equ $1                             ; Wait cycles after the RNG is ready
 COMMAND_TIMEOUT           equ $0000FFFF                      ; Timeout for the command

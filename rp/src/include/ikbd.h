@@ -108,7 +108,7 @@ void ikbd_request_boot_gem(void);
 
 /* Re-arm the command sentinel to CMD_NOP. Call once per main-loop
  * iteration so a BOOT_GEM posted by ikbd_request_boot_gem() is a
- * one-shot: userfw consumes it during the exit frame's fb_publish, then
+ * one-shot: userfw consumes it during the exit frame's VBL, then
  * this wipes it. Without it, the value persists across an ST reset (the
  * m68k can't clear the RP-owned region; the RP zeroes it only at boot)
  * and the re-run userfw quits to GEM instead of running the app. */

@@ -18,8 +18,7 @@
 #include "pico/stdlib.h"
 
 #include "audio.h"
-#include "fb.h"
-#include "fb_chunked.h"
+#include "fb.h"           // cart-FB cursor (and cart_shared.h's layout)
 #include "palette.h"
 #include "cart_shared.h"  // __cart_app_free() for the buffers parked below
 #include "debug.h"
@@ -49,9 +48,12 @@ void vram_force_dirty(void);
 #include "builtin_pongwars.h"
 
 // The Spectrum bitmap (256x192) is shown 1:1, centred in the 320x200
-// framebuffer; the surrounding margin is the Spectrum border.
-#define ZX_FB_X0 ((FB_CHUNKED_W - 256) / 2)   // 32
-#define ZX_FB_Y0 ((FB_CHUNKED_H - 192) / 2)   // 4
+// ST low-res screen; the surrounding margin is the Spectrum border.
+// ZX_FB_X0 must stay a multiple of 16 (whole ST planar groups).
+#define ZX_FB_ROW_BYTES 160                   // ST low-res: 320 px, 4 planes
+#define ZX_FB_X0 ((320 - 256) / 2)            // 32
+#define ZX_FB_Y0 ((200 - 192) / 2)            // 4
+_Static_assert(ZX_FB_X0 % 16 == 0, "bitmap must start on an ST group");
 
 #define ZX_DEFAULT_SCANLINE_PERIOD 150
 
@@ -234,8 +236,9 @@ struct emustate {
     // Speed sampling, averaged over a ~1 s window by zxemu_render_frame()
     // and reported in the About pop-over.
     uint32_t perf_exec_us;   // Mean zx_exec() time per emulated frame.
-    uint32_t perf_disp_us;   // Mean display path (overlay + decode) time.
-    uint32_t perf_pub_us;    // Mean fb_publish() (transpose+wait+copy) time.
+    uint32_t perf_disp_us;   // Mean update_display() (cart-FB decode) time.
+    uint32_t perf_disp_max_us; // Its worst frame in the window.
+    uint32_t perf_wait_us;   // Mean time blocked in fb_wait_vbl().
     uint32_t perf_fps_x10;   // Achieved frames per second, in tenths.
 } EMU;
 
@@ -539,7 +542,7 @@ static const char *AboutLines[] = {
     "neilrackett.com/atarist",
     "",
     NULL,   // speed readout, filled in below
-    NULL,   // display/publish breakdown, filled in below
+    NULL,   // display/wait breakdown, filled in below
 };
 #define ABOUT_NLINES ((int)(sizeof(AboutLines) / sizeof(AboutLines[0])))
 
@@ -581,8 +584,9 @@ void ui_draw_about(void) {
              MS(EMU.perf_exec_us),
              (unsigned long)(EMU.perf_fps_x10 / 10u),
              (unsigned long)(EMU.perf_fps_x10 % 10u));
-    snprintf(AboutStats[1], sizeof(AboutStats[1]), "dsp %lu.%lums  pub %lu.%lums",
-             MS(EMU.perf_disp_us), MS(EMU.perf_pub_us));
+    snprintf(AboutStats[1], sizeof(AboutStats[1]), "dsp %lu.%lu/%lu.%lu wait %lu.%lums",
+             MS(EMU.perf_disp_us), MS(EMU.perf_disp_max_us),
+             MS(EMU.perf_wait_us));
     AboutLines[ABOUT_NLINES - 2] = AboutStats[0];
     AboutLines[ABOUT_NLINES - 1] = AboutStats[1];
 
@@ -641,67 +645,106 @@ void zx_set_palette(void) {
     }
 }
 
-// Nibble -> byte-lane mask for the decode below: bit 3 of the nibble
-// (the leftmost of its 4 pixels) selects byte lane 0 of a little-endian
-// word. Validated offline against the byte-wise loop it replaced, over
-// every (bits, attr, blink) combination.
-static const uint32_t zx_nib_mask[16] = {
-    0x00000000u, 0xFF000000u, 0x00FF0000u, 0xFFFF0000u,
-    0x0000FF00u, 0xFF00FF00u, 0x00FFFF00u, 0xFFFFFF00u,
-    0x000000FFu, 0xFF0000FFu, 0x00FF00FFu, 0xFFFF00FFu,
-    0x0000FFFFu, 0xFF00FFFFu, 0x00FFFFFFu, 0xFFFFFFFFu,
+// Byte-lane masks for the decode below: entry x (0..3) has 0xFF in lane 0
+// if bit 0 of x is set and in lane 2 if bit 1 is. Indexed by (colour & 3)
+// they give planes 0 and 1 of a colour, by (colour >> 2) planes 2 and 3,
+// in the layout of one 32-bit half of a cart-FB group (fb.h): lanes 0/2
+// are the right-hand cell's byte of each plane word, lanes 1/3 (the same
+// value << 8) the left-hand cell's. XOR-linear, so the masks of
+// (ink ^ paper) are the planes where ink and paper differ. In RAM so the
+// decode never waits on XIP.
+static uint32_t zx_plane_lanes[4] = {
+    0x00000000u, 0x000000FFu, 0x00FF0000u, 0x00FF00FFu,
 };
 
-// Decode the 256x192 Spectrum bitmap + attribute VRAM into the
-// template's chunked framebuffer, one palette-index byte per pixel,
-// centred at (ZX_FB_X0, ZX_FB_Y0). The surrounding margin is the
-// border colour. Runs every VBL; the m68k blits the result to the ST.
+// Planes of one Spectrum cell (8 pixels) in the lanes described above:
+// per plane, the bitmap byte where only the ink has the plane's bit, its
+// complement where only the paper does, solid where they agree.
+static inline __attribute__((always_inline)) void zx_cell_planes(
+        uint32_t bits, uint32_t attr, uint32_t flash_mask,
+        uint32_t *lo, uint32_t *hi) {
+    const uint32_t bright = (attr & 0x40) >> 3;   // 0 or 8
+    uint32_t ink = (attr & 7) | bright;
+    uint32_t paper = ((attr >> 3) & 7) | bright;
+    if (attr & flash_mask) {                      // FLASH: swap ink/paper
+        uint32_t t = ink; ink = paper; paper = t;
+    }
+    const uint32_t diff = ink ^ paper;            // bright cancels: < 8
+    const uint32_t b = bits * 0x00010001u;        // bitmap in lanes 0 and 2
+    *lo = zx_plane_lanes[paper & 3] ^ (zx_plane_lanes[diff & 3] & b);
+    *hi = zx_plane_lanes[paper >> 2] ^ (zx_plane_lanes[diff >> 2] & b);
+}
+
+// Fill `bytes` of the image from byte offset `o` with border colour
+// groups (both offsets multiples of 8).
+static inline void zx_fill_run(uint32_t o, uint32_t bytes,
+                               uint32_t lo, uint32_t hi) {
+    fb_cursor_t cur;
+    fb_cursor_seek(&cur, o);
+    for (uint32_t n = bytes / 8u; n; n--) fb_cursor_put(&cur, lo, hi);
+}
+
+// Decode the 256x192 Spectrum bitmap + attribute VRAM straight into the
+// ST planar cart framebuffer, centred at (ZX_FB_X0, ZX_FB_Y0); the margin
+// is the border colour. Runs once per VBL, right after fb_wait_vbl() (the
+// cart FB is the m68k's source, so this is the only time it may be
+// written). Each 16-pixel ST group is two attribute cells, written as two
+// 32-bit stores through an fb_cursor_t, which takes care of the cart FB's
+// reversed chunk order.
+//
+// Rows go bottom-up, border first: the m68k's next blit copies the image
+// bottom-up too, starting at the next VBL, so the writes stay ahead of it
+// (see fb_wait_vbl).
 //
 // Incremental: only rows flagged in EMU.dirty_vram (maintained by the
-// mem.h write hooks) are re-decoded, and the border/canvas is cleared
-// only when the border colour changes -- callers that bypass the write
-// hooks (menu overlay, snapshot loads, FLASH blink) must call
-// vram_force_dirty() first. Each attribute cell is written as two
-// 32-bit stores via zx_nib_mask (fb_chunked_buffer is 4-byte aligned
-// and ZX_FB_X0 / FB_CHUNKED_W keep every row start aligned).
+// mem.h write hooks) are re-decoded, and the border is repainted only
+// when its colour changes -- callers that bypass the write hooks (menu
+// overlay, snapshot loads, FLASH blink) must call vram_force_dirty()
+// first. The cart FB keeps the last frame between calls, which is what
+// makes skipping clean rows correct.
 #pragma GCC push_options
 #pragma GCC optimize("O2")
 void __not_in_flash_func(update_display)(void) {
     const uint8_t *vmem = EMU.zx.ram[EMU.zx.display_ram_bank];
     const uint8_t border = EMU.show_border ? EMU.zx.border_color : 0;
+    const uint32_t flash_mask = zx_blink_phase ? 0x80u : 0u;
 
     // Border changed (or vram_force_dirty's 0xff sentinel): repaint the
-    // whole canvas; the row loop below then rebuilds the bitmap area.
+    // margin, then every bitmap row. In image order the margin is: the
+    // last bitmap row's right edge plus the bottom rows, the right edge of
+    // each row plus the left edge of the next, and the top rows plus the
+    // first bitmap row's left edge.
     bool full = false;
     if (border != EMU.last_update_border_color) {
-        fb_chunked_clear(border);
+        const uint32_t lo = zx_plane_lanes[border & 3] * 0x0101u;
+        const uint32_t hi = zx_plane_lanes[border >> 2] * 0x0101u;
+        const uint32_t right = (ZX_FB_X0 + 256) / 2;  // bytes into a row
+        const uint32_t edges = ZX_FB_ROW_BYTES - 256 / 2;
+        zx_fill_run((ZX_FB_Y0 + 191) * ZX_FB_ROW_BYTES + right,
+                    CART_FRAMEBUFFER_SIZE -
+                        ((ZX_FB_Y0 + 191) * ZX_FB_ROW_BYTES + right),
+                    lo, hi);
+        for (int y = ZX_FB_Y0 + 190; y >= ZX_FB_Y0; y--)
+            zx_fill_run(y * ZX_FB_ROW_BYTES + right, edges, lo, hi);
+        zx_fill_run(0, ZX_FB_Y0 * ZX_FB_ROW_BYTES + ZX_FB_X0 / 2, lo, hi);
         EMU.last_update_border_color = border;
         full = true;
     }
 
-    for (int py = 0; py < 192; py++) {
+    for (int py = 191; py >= 0; py--) {
         if (!full && !(EMU.dirty_vram[py >> 3] & (1u << (py & 7)))) continue;
         const uint8_t *row = vmem +
             (((py & 0xC0) << 5) | ((py & 0x07) << 8) | ((py & 0x38) << 2));
         const uint8_t *attrrow = vmem + 0x1800 + ((py >> 3) << 5);
-        uint32_t *dst = (uint32_t *)(fb_chunked_buffer +
-            (ZX_FB_Y0 + py) * FB_CHUNKED_W + ZX_FB_X0);
+        fb_cursor_t cur;
+        fb_cursor_seek(&cur, (ZX_FB_Y0 + py) * ZX_FB_ROW_BYTES + ZX_FB_X0 / 2);
 
-        for (int bx = 0; bx < 32; bx++) {
-            uint8_t bits = row[bx];
-            uint8_t attr = attrrow[bx];
-            uint8_t bright = (attr & 0x40) >> 3;    // 0 or 8
-            uint8_t ink = (attr & 7) | bright;
-            uint8_t paper = ((attr >> 3) & 7) | bright;
-            if ((attr & 0x80) && zx_blink_phase) {  // FLASH: swap ink/paper
-                uint8_t t = ink; ink = paper; paper = t;
-            }
-            const uint32_t inkw = ink * 0x01010101u;
-            const uint32_t paperw = paper * 0x01010101u;
-            const uint32_t mhi = zx_nib_mask[bits >> 4];
-            const uint32_t mlo = zx_nib_mask[bits & 15u];
-            *dst++ = (inkw & mhi) | (paperw & ~mhi);
-            *dst++ = (inkw & mlo) | (paperw & ~mlo);
+        for (int bx = 0; bx < 32; bx += 2) {
+            uint32_t llo, lhi, rlo, rhi;
+            zx_cell_planes(row[bx], attrrow[bx], flash_mask, &llo, &lhi);
+            zx_cell_planes(row[bx + 1], attrrow[bx + 1], flash_mask,
+                           &rlo, &rhi);
+            fb_cursor_put(&cur, rlo | (llo << 8), rhi | (lhi << 8));
         }
     }
 
@@ -746,17 +789,167 @@ static int snapshot_type(const char *name) {
     return SNAP_NONE;
 }
 
+// Snapshots are streamed from the file straight into Spectrum RAM through
+// this small buffer, so a whole image never has to fit in memory.
+static uint8_t s_load_buf[512] __cart_app_free("load_buf");
+
+typedef struct {
+    FIL *f;
+    UINT len, pos;   // valid bytes in s_load_buf, next one to hand out
+} zx_reader_t;
+
+// Next byte of the file, or -1 at the end (or on a read error).
+static int zx_rd_byte(zx_reader_t *r) {
+    if (r->pos == r->len) {
+        r->pos = 0;
+        if (f_read(r->f, s_load_buf, sizeof(s_load_buf), &r->len) != FR_OK)
+            r->len = 0;
+        if (r->len == 0) return -1;
+    }
+    return s_load_buf[r->pos++];
+}
+
+// Read n bytes into dst (NULL: skip them). False if the file ends first.
+static bool zx_rd(zx_reader_t *r, uint8_t *dst, uint32_t n) {
+    while (n) {
+        if (r->pos == r->len) {
+            if (dst && n >= sizeof(s_load_buf)) {  // big reads skip the copy
+                UINT br = 0;
+                return f_read(r->f, dst, n, &br) == FR_OK && br == n;
+            }
+            r->pos = 0;
+            if (f_read(r->f, s_load_buf, sizeof(s_load_buf), &r->len) != FR_OK)
+                r->len = 0;
+            if (r->len == 0) return false;
+        }
+        uint32_t k = r->len - r->pos;
+        if (k > n) k = n;
+        if (dst) { memcpy(dst, s_load_buf + r->pos, k); dst += k; }
+        r->pos += k;
+        n -= k;
+    }
+    return true;
+}
+
+// Decode one .z80 memory block into dst[0..cap) (dst NULL: skip it). The
+// format's RLE: "ED ED n b" is n copies of b, anything else is literal.
+// A version 2/3 block is exactly src_len input bytes. A version 1 image
+// (src_len 0) is the whole 48 KB, followed by a 00 ED ED 00 end marker
+// that a valid image can't contain earlier, so it ends once cap bytes
+// are out. Output past cap is dropped rather than overrunning RAM.
+static bool zx_z80_unpack(zx_reader_t *r, uint8_t *dst, uint32_t cap,
+                          uint32_t src_len) {
+    uint32_t in = 0, out = 0;
+    while (src_len ? in < src_len : out < cap) {
+        int b = zx_rd_byte(r);
+        if (b < 0) return false;
+        in++;
+        int n = 1;
+        if (b == 0xED) {
+            int b2 = zx_rd_byte(r);
+            if (b2 < 0) return false;
+            in++;
+            if (b2 == 0xED) {
+                n = zx_rd_byte(r);
+                b = zx_rd_byte(r);
+                if (n < 0 || b < 0) return false;
+                in += 2;
+            } else {                       // a lone ED, then b2 (not ED)
+                if (dst && out < cap) dst[out] = 0xED;
+                out++;
+                b = b2;
+            }
+        }
+        for (; n > 0; n--, out++)
+            if (dst && out < cap) dst[out] = (uint8_t)b;
+    }
+    return true;
+}
+
+// Load a 48K .z80 snapshot (versions 1, 2 and 3): a 30-byte register
+// header; version 1 continues with the 48 KB image ($4000-$FFFF, RLE'd if
+// flags0 bit 5 is set), versions 2/3 (PC = 0 in the main header) with an
+// extended header and then one block per 16 KB page -- page 8 is $4000,
+// 4 is $8000, 5 is $C000; others are skipped. A block length of 0xFFFF
+// means 16 KB stored raw. 128K images (hardware mode >= 3) are rejected
+// before anything is written, leaving the running machine untouched.
+// Registers are set as upstream's zx_quickload() sets them.
+static bool zx_load_z80(zx_t *sys, zx_reader_t *r) {
+    _zx_z80_header hdr;
+    _zx_z80_ext_header ext;
+    if (!zx_rd(r, (uint8_t *)&hdr, sizeof(hdr))) return false;
+    if (hdr.flags0 == 0xFF) hdr.flags0 = 1;   // per the format spec
+    uint16_t pc = (uint16_t)((hdr.PC_h << 8) | hdr.PC_l);
+    const bool v1 = pc != 0;
+    if (!v1) {
+        // Extended header: its 2-byte length, then that many bytes, of
+        // which we keep what fits in the struct (23, 54 or 55 on disk).
+        memset(&ext, 0, sizeof(ext));
+        if (!zx_rd(r, &ext.len_l, 2)) return false;
+        const uint32_t len = (uint32_t)((ext.len_h << 8) | ext.len_l);
+        const uint32_t keep = len < sizeof(ext) - 2 ? len : sizeof(ext) - 2;
+        if (len < 3 || !zx_rd(r, &ext.PC_l, keep) ||
+            !zx_rd(r, NULL, len - keep))
+            return false;
+        if (ext.hw_mode >= 3) return false;
+        pc = (uint16_t)((ext.PC_h << 8) | ext.PC_l);
+    }
+
+    if (v1) {
+        uint8_t *mem = sys->ram[0];            // ram[0..2]: $4000-$FFFF
+        if (hdr.flags0 & (1 << 5)) {
+            if (!zx_z80_unpack(r, mem, 3 * 0x4000, 0)) return false;
+        } else if (!zx_rd(r, mem, 3 * 0x4000)) {
+            return false;
+        }
+    } else {
+        uint8_t ph[3];                         // len lo, len hi, page
+        while (zx_rd(r, ph, sizeof(ph))) {
+            const uint32_t len = (uint32_t)((ph[1] << 8) | ph[0]);
+            uint8_t *dst = ph[2] == 8 ? sys->ram[0] :
+                           ph[2] == 4 ? sys->ram[1] :
+                           ph[2] == 5 ? sys->ram[2] : NULL;
+            const bool ok = len == 0xFFFF ? zx_rd(r, dst, 0x4000)
+                                          : zx_z80_unpack(r, dst, 0x4000, len);
+            if (!ok) return false;
+        }
+    }
+
+    z80_reset(&sys->cpu);
+    sys->cpu.a = hdr.A; sys->cpu.f = hdr.F;
+    sys->cpu.b = hdr.B; sys->cpu.c = hdr.C;
+    sys->cpu.d = hdr.D; sys->cpu.e = hdr.E;
+    sys->cpu.h = hdr.H; sys->cpu.l = hdr.L;
+    sys->cpu.ix = (hdr.IX_h << 8) | hdr.IX_l;
+    sys->cpu.iy = (hdr.IY_h << 8) | hdr.IY_l;
+    sys->cpu.af2 = (hdr.A_ << 8) | hdr.F_;
+    sys->cpu.bc2 = (hdr.B_ << 8) | hdr.C_;
+    sys->cpu.de2 = (hdr.D_ << 8) | hdr.E_;
+    sys->cpu.hl2 = (hdr.H_ << 8) | hdr.L_;
+    sys->cpu.sp = (hdr.SP_h << 8) | hdr.SP_l;
+    sys->cpu.i = hdr.I;
+    sys->cpu.r = (hdr.R & 0x7F) | ((hdr.flags0 & 1) << 7);
+    sys->cpu.iff2 = (hdr.IFF2 != 0);
+    sys->cpu.iff1 = (hdr.EI != 0);
+    sys->cpu.im = (hdr.flags1 != 0xFF) ? (hdr.flags1 & 3) : 1;
+    sys->pins = z80_prefetch(&sys->cpu, pc);
+    sys->border_color = (hdr.flags0 >> 1) & 7;
+    return true;
+}
+
 // Load a 48K .sna snapshot: a 27-byte register header followed by a raw
 // 48 KB dump of $4000-$FFFF (no compression). PC is not in the header --
 // the save pushed it onto the stack, so loading emulates RETN: pop PC,
 // SP += 2, IFF2 -> IFF1. 128K .sna images are a different size and are
 // rejected (this is a 48K machine).
-static bool zx_quickload_sna(zx_t *sys, chips_range_t data) {
-    if (data.size != 27 + 0xC000) return false;
-    const uint8_t *h = data.ptr;
-    memcpy(sys->ram[0], h + 27, 0x4000);            // $4000
-    memcpy(sys->ram[1], h + 27 + 0x4000, 0x4000);   // $8000
-    memcpy(sys->ram[2], h + 27 + 0x8000, 0x4000);   // $C000
+static bool zx_load_sna(zx_t *sys, zx_reader_t *r, uint32_t size) {
+    if (size != 27 + 0xC000) return false;
+    uint8_t h[27];
+    if (!zx_rd(r, h, sizeof(h)) ||
+        !zx_rd(r, sys->ram[0], 0x4000) ||           // $4000
+        !zx_rd(r, sys->ram[1], 0x4000) ||           // $8000
+        !zx_rd(r, sys->ram[2], 0x4000))             // $C000
+        return false;
     z80_reset(&sys->cpu);
     sys->cpu.i   = h[0];
     sys->cpu.hl2 = (h[2] << 8) | h[1];
@@ -898,27 +1091,19 @@ void load_game(int game_id) {
     if (EMU.loaded_game != game_id)
         EMU.zx.scanline_period = ZX_DEFAULT_SCANLINE_PERIOD;
 
-    // Borrow the chunked framebuffer as a transient load buffer -- it is
-    // overwritten by the next update_display() anyway, so this avoids a
-    // permanent ~50 KB allocation for the snapshot image.
     char path[96];
     snprintf(path, sizeof(path), "%s/%s", zx_folder, g->name);
     FIL f;
     if (f_open(&f, path, FA_READ) != FR_OK) return;
-    uint32_t cap = FB_CHUNKED_SIZE;
-    if (g->size && g->size < cap) cap = g->size;
-    UINT br = 0;
-    f_read(&f, fb_chunked_buffer, cap, &br);
-    f_close(&f);
-    chips_range_t r = { .ptr = fb_chunked_buffer, .size = br };
+    zx_reader_t r = { .f = &f };
     if (snapshot_type(g->name) == SNAP_SNA)
-        zx_quickload_sna(&EMU.zx, r);
+        zx_load_sna(&EMU.zx, &r, (uint32_t)f_size(&f));
     else
-        zx_quickload(&EMU.zx, r);
+        zx_load_z80(&EMU.zx, &r);
+    f_close(&f);
 
     EMU.loaded_game = game_id;
-    vram_force_dirty();  // snapshot rewrote VRAM behind the mem.h hooks,
-                         // and the load borrowed fb_chunked_buffer
+    vram_force_dirty();  // snapshot rewrote VRAM behind the mem.h hooks
 }
 
 /* ============================ Public entry points ========================= */
@@ -1061,7 +1246,7 @@ void zxemu_render_frame(void) {
     // reads. (The first window spans boot to first rollover -- its fps
     // reads slightly low once, which isn't worth a special case.)
     static uint32_t acc_win_us = 0, acc_exec_us = 0, acc_frames = 0;
-    static uint32_t acc_disp_us = 0, acc_pub_us = 0;
+    static uint32_t acc_disp_us = 0, acc_disp_max_us = 0, acc_wait_us = 0;
     const uint32_t t0 = time_us_32();
     zx_exec(&EMU.zx, zx_frame_usec());
     const uint32_t t1 = time_us_32();
@@ -1071,16 +1256,19 @@ void zxemu_render_frame(void) {
         const uint32_t span = t1 - acc_win_us;
         EMU.perf_exec_us = acc_exec_us / acc_frames;
         EMU.perf_disp_us = acc_disp_us / acc_frames;
-        EMU.perf_pub_us = acc_pub_us / acc_frames;
+        EMU.perf_disp_max_us = acc_disp_max_us;
+        EMU.perf_wait_us = acc_wait_us / acc_frames;
         EMU.perf_fps_x10 =
             (uint32_t)(((uint64_t)acc_frames * 10000000u) / span);
-        DPRINTF("emu %u disp %u pub %u us/frame, %u.%u fps\n",
-                EMU.perf_exec_us, EMU.perf_disp_us, EMU.perf_pub_us,
+        DPRINTF("emu %u disp %u (max %u) wait %u us/frame, %u.%u fps\n",
+                EMU.perf_exec_us, EMU.perf_disp_us, EMU.perf_disp_max_us,
+                EMU.perf_wait_us,
                 EMU.perf_fps_x10 / 10u, EMU.perf_fps_x10 % 10u);
         acc_win_us = t1;
         acc_exec_us = 0;
         acc_disp_us = 0;
-        acc_pub_us = 0;
+        acc_disp_max_us = 0;
+        acc_wait_us = 0;
         acc_frames = 0;
     }
 
@@ -1097,7 +1285,6 @@ void zxemu_render_frame(void) {
     // repaint the overwritten cells, leaving artifacts after dismissal).
     uint8_t *vram = EMU.zx.ram[EMU.zx.display_ram_bank];
     const bool overlay = EMU.about_active || EMU.menu_active;
-    const uint32_t td0 = time_us_32();
     if (overlay) {
         memcpy(s_vram_save, vram, ZX_VRAM_SIZE);
         if (EMU.about_active) ui_draw_about();
@@ -1105,22 +1292,23 @@ void zxemu_render_frame(void) {
         vram_force_dirty();   // overlay drew into VRAM behind the hooks
     }
 
-    // Decode VRAM into the framebuffer and hand off to the ST (blocks
-    // on the VBL, pacing this loop to 50 Hz).
+    // Wait until the m68k has copied the last frame out of the cart FB
+    // (this paces the loop to the 50 Hz VBL), then decode VRAM straight
+    // into it. The decode time is what the cart-FB write window has to
+    // absorb, so it's measured on its own, worst frame included.
+    const uint32_t tw = time_us_32();
+    fb_wait_vbl();
+    const uint32_t td0 = time_us_32();
     update_display();
+    const uint32_t td = time_us_32() - td0;
+    acc_wait_us += td0 - tw;
+    acc_disp_us += td;
+    if (td > acc_disp_max_us) acc_disp_max_us = td;
 
     if (overlay) {
         memcpy(vram, s_vram_save, ZX_VRAM_SIZE);  // undo the overlay
         vram_force_dirty();  // next frame must repaint what it covered
     }
-    const uint32_t td1 = time_us_32();
-    acc_disp_us += td1 - td0;
-
-    // Deliberately timed from outside (unlike fb_last_convert_us(),
-    // which is transpose+copy only): "pub" includes the VBL wait, so an
-    // unexpected stall in the pacing shows up here instead of hiding.
-    fb_publish();
-    acc_pub_us += time_us_32() - td1;
 
     EMU.tick++;
 }

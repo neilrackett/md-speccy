@@ -9,10 +9,8 @@
 ;      main loop by clearing a flag in ST RAM. We DON'T use XBIOS
 ;      Vsync (trap #14, #37) -- that trips through TOS's GEMDOS-aware
 ;      dispatch and adds latency / jitter.
-;   2. Read FB_FRAME_COUNTER_ADDR ($FA400C). The RP increments this
-;      after every fb_render_frame() with a memory barrier. If
-;      unchanged since last iteration (D4), the FB has nothing new
-;      and we skip the blit + flip entirely.
+;   2. Copy the RP-published palette to the shifter. There is no
+;      dirty-frame skip: the blit below runs every VBL.
 ;   3. Copy the 32 KB cart framebuffer ($FA8300) into the hidden
 ;      ST screen page selected by A4. The copy is a pure 68000 CPU
 ;      MOVEM burst expanded inline via FBDRV_INLINE -- same code on
@@ -129,7 +127,7 @@ FBDRV_TAIL_DISP       equ FBDRV_MAIN_BYTES                        ; tail goes at
 ; chunk into the destination ST page in REVERSE order relative to
 ; the source -- chunks land from the screen-page END (offset 31980)
 ; down to the START (offset 0). For the displayed image to look
-; correct, the RP-side fb_chunky_to_planar pre-reverses chunks in
+; correct, the RP side (fb_cursor_t in fb.h) pre-reverses chunks in
 ; the cart FB at $FA8300, so the m68k's reversal restores the
 ; natural image. See "Framebuffer chunk layout for the m68k MOVEM
 ; blit" in rp/src/include/cart_shared.h for the full spec.
@@ -162,7 +160,7 @@ FBDRV_INLINE          macro
     ; region that the chunked main loop can't reach (FB_COPY_LINES *
     ; 160 isn't a multiple of FBDRV_ITER_BYTES=48). A6 is at
     ; UFW_FB_SRC + FBDRV_MAIN_BYTES after the REPT; A5 is back at
-    ; page_start. The RP-side fb_chunky_to_planar leaves these tail
+    ; page_start. The RP side (fb_cursor_t) leaves these tail
     ; bytes in NATURAL (non-reversed) order in cart-FB, so this is a
     ; straight forward-direction copy via d16(a5).
     ;
@@ -187,10 +185,9 @@ FBDRV_INLINE          macro
 ; framebuffer template because we own the screen until ESC exit.
 VBL_VECTOR            equ $70
 
-; FB dirty-frame counter (lives in cart shared region at $FA400C). The
-; RP fills the framebuffer and then writes a new value here as the
-; LAST step of the frame. If this matches D4 (last seen) we skip the
-; cart->ST blit + video flip entirely.
+; FB dirty-frame counter slot ($FA400C). Unused: nothing reads it and
+; the RP no longer writes it (the blit runs every VBL); kept so the
+; shared-region layout doesn't move.
 FB_FRAME_COUNTER      equ $00FA400C
 
 ; RP→m68k command sentinel at $FA4000. The RP IKBD demux writes
@@ -858,11 +855,11 @@ userfw:
     eor.l   #UFW_SCREEN_XOR, d0
     move.l  d0, UFW_SCREEN_PAGE
 
-    ; Frame-sync ack (Epic 5): one cart-bus read tells the RP the blit
-    ; is finished and the cart FB is free to overwrite. Emitted every
+    ; Frame-sync ack: one cart-bus read tells the RP the blit is
+    ; finished and the cart FB is free to overwrite. Emitted every
     ; VBL (the FB is free here -- blit done, page flipped). The RP's
-    ; commemul ring captures the read; fb_publish() on the RP blocks
-    ; until it sees this before running the next chunky-to-planar.
+    ; commemul ring captures the read; fb_wait_vbl() on the RP blocks
+    ; until it sees this before writing the next frame into the FB.
     tst.b   VBLSYNC_ADDR
 
 .input_check:

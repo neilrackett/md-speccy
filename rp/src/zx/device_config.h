@@ -10,7 +10,7 @@
  *
  * On this target there is no ST77xx display and no GPIO buttons:
  *   - the "display" is the 320x200 framebuffer that the firmware blits
- *     to the Atari ST each VBL (see fb_chunked.h), and
+ *     to the Atari ST each VBL (see fb.h), and
  *   - input is decoded from the Atari ST keyboard / joystick on the
  *     RP2040 and applied directly to the emulator in zxemu.c, via
  *     zx_key_down/zx_key_up (Spectrum keys) and zx_joystick (Kempston).

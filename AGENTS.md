@@ -154,23 +154,27 @@ the ST over the emulated cartridge bus (PIO + DMA).
 
 Every visible pixel goes through this each VBL:
 
-1. **RP draws into a chunked buffer** — `fb_chunked_buffer` (320×200
-   bytes, one palette index per pixel) at RP `0x20000000+`.
-2. **RP publishes via chunky→planar** — `fb_chunked_asm.S` (`fb_c2p_half`)
-   bit-transposes to ST planar 4 bpp. Split **Core 0 (top 100 rows) /
-   Core 1 (bottom 100)** via the inter-core FIFO into `fb_planar_scratch`
-   (32 KB RP RAM), then `fb_chunky_to_planar` publishes into the cart FB
-   at `$FA8300` with 48-byte MOVEM chunks **pre-reversed** (so the m68k's
-   predec store lands each chunk at its natural position). ~1 ms.
+1. **RP waits for the m68k's end-of-blit ack** — `fb_wait_vbl()` blocks
+   until the VBLSYNC read at `$FB8400` shows the m68k has finished copying
+   the cart FB; one call per loop paces the app to 50 Hz.
+2. **RP writes ST planar data straight into the cart FB** at `$FA8300`
+   (`update_display()` in `zxemu.c`, through `fb_cursor_t` in `fb.h`).
+   The cart FB's 48-byte chunks are stored **pre-reversed** (so the
+   m68k's predec store lands each chunk at its natural position);
+   `fb_cursor_t` hides that — a 16-pixel group (8 bytes) never straddles
+   a chunk, so it writes whole groups and re-aims at chunk boundaries.
+   There is no RP-side chunky buffer or planar scratch copy any more
+   (the template's `fb_chunked_buffer` + `fb_planar_scratch` + dual-core
+   c2p were removed: 96 KB of RAM, see the RAM budget).
 3. **m68k blits cart FB → ST screen** in `userfw.s` via `FBDRV_INLINE`
-   (unrolled `movem.l` load + predec store, 12 longwords/48 B per iter).
-   A0 (audio cursor) and A7 (SP) are kept out of the MOVEM list. Pure
-   68000, same code on ST/STE/MegaSTE/TT/Falcon.
+   (unrolled `movem.l` load + predec store, 12 longwords/48 B per iter),
+   unconditionally every VBL. A0 (audio cursor) and A7 (SP) are kept out
+   of the MOVEM list. Pure 68000, same code on ST/STE/MegaSTE/TT/Falcon.
+   Because the chunks are reversed it copies the **image bottom-up** over
+   most of the frame — so the RP writes rows bottom-up too, starting at
+   the ack, and stays ahead of it (~5 µs/row against the m68k's ~88).
 4. **m68k flips video base** between `$70000`/`$78000` each frame
    (page-flip, tear-free).
-
-`fb_publish()` (RP) does the transpose + publish and **blocks on the ST
-VBL** — one call per loop paces the app to 50 Hz.
 
 ### IKBD pipeline (keyboard + ESC exit + joystick)
 
@@ -202,7 +206,7 @@ VBL** — one call per loop paces the app to 50 Hz.
    re-reads it → straight back to GEM). The main loop calls
    `ikbd_clear_command()` (re-arm to `CART_CMD_NOP`) every iteration;
    `BOOT_GEM` survives the one frame between the exit write and userfw's
-   VBL read (`fb_publish` blocks until that read), then the next
+   VBL read (`fb_wait_vbl` blocks until that read), then the next
    iteration wipes it, so a later reset auto-boots MD/Speccy cleanly.
 
 ### Audio pipeline (STE DMA with YM fallback)
@@ -293,10 +297,13 @@ hard-code. Key offsets: cartridge image (16 KB), `CMD_MAGIC_SENTINEL`
   `ikbd_pump()`, drain keys → `zxemu_handle_key()`,
   `zxemu_render_frame()`, `audio_render_frame()`. (The template's demo
   dispatcher was removed.)
-- `fb.c` / `fb_chunked.c` / `fb_blit.c` / `fb_font.c` — framebuffer +
-  draw primitives + the dual-core c2p worker. `fb_publish()` is the
-  VBL-synced hand-off. (`fb_render_frame` and the internal demo sprite
-  are legacy and now only paint the boot frame; MD/Speccy overwrites it.)
+- `fb.c` / `fb.h` — the cart framebuffer (`fb_screen`), the VBL
+  frame-sync (`fb_wait_vbl()`, `fb_pump_rom3()`) and the `fb_cursor_t`
+  writer for the reversed-chunk layout. The template's chunky buffer,
+  c2p, blit/font primitives and boot demo frame were removed.
+- `fb_core1.c` — the Core 1 job worker (`fb_core1_dispatch`/`_wait`),
+  launched by `fb_init()`. Its only client now is `audio.c`, which
+  starts its refill timer on Core 1 through it.
 - `commemul.c` — ROM3 cart-bus capture ring. **The ring was shrunk from
   32 KB to 1 KB** for MD/Speccy (`COMM_RING_BITS` 15→10) — it only
   carries IKBD bytes plus a few per-VBL report reads, and the RAM was
@@ -324,8 +331,8 @@ SRAM):**
 `__StackLimit` is capped at the RAM/cart boundary (`ORIGIN(RAM) +
 LENGTH(RAM)`) so malloc can't hand the cart region to FatFs. Flash: 1 MB
 app `FLASH`, plus Booster / config / lookup regions — don't write those.
-Core 0 overclocks to 225 MHz @ `VREG_VOLTAGE_1_10`; **Core 1 is owned by
-the c2p worker.**
+The system clock is 400 MHz @ `VREG_VOLTAGE_1_30` (see Speed); **Core 1
+runs the job worker and the audio refill timer.**
 
 ### App identity
 `CURRENT_APP_UUID_KEY` (from `APP_UUID_KEY` at CMake time, default
@@ -364,36 +371,43 @@ the c2p worker.**
 
 | zx2040 | Replaced with |
 | --- | --- |
-| ST77xx display driver | `update_display()` decodes 256×192 VRAM → `fb_chunked_buffer` at (32,4), one palette index/pixel, then `fb_publish()` |
+| ST77xx display driver | `fb_wait_vbl()`, then `update_display()` decodes 256×192 VRAM straight into the ST-planar cart FB at (32,4) |
 | GPIO buttons | `zxemu_handle_key()` applies ST keys directly via `zx_key_down/up`; the cursor cluster + ST joystick drive `zx_joystick()` (Kempston) |
-| PWM beeper on Core 1 | `zxemu_audio_fill` → STE DMA PCM or YM (Core 1 freed for c2p) |
-| flash game blob | FatFs enum of `/speccy`, `.z80` via `zx_quickload`, `.sna` via `zx_quickload_sna` |
+| PWM beeper on Core 1 | `zxemu_audio_fill` → STE DMA PCM or YM, refilled from a Core 1 timer |
+| flash game blob | FatFs enum of `/speccy`, `.z80` via `zx_load_z80`, `.sna` via `zx_load_sna` (both stream from the file) |
 
 ### Display decode (validated offline)
 
-`update_display()` (in `zxemu.c`, `__not_in_flash_func`, `-O2` region) is
-**dirty-row incremental**: the `mem.h` write hooks maintain a per-row
-bitmap (`EMU.dirty_vram`, one bit per scanline; attribute writes mark all
-8 covered rows) and only flagged rows are re-decoded; the border/canvas
-is cleared only when the border colour changes
-(`EMU.last_update_border_color`, `0xff` = forced). **Anything that
-touches VRAM or the framebuffer behind the hooks must call
+`update_display()` (in `zxemu.c`, `__not_in_flash_func`, `-O2` region)
+runs right after `fb_wait_vbl()` and writes the ST-planar cart FB
+directly. It is **dirty-row incremental**: the `mem.h` write hooks
+maintain a per-row bitmap (`EMU.dirty_vram`, one bit per scanline;
+attribute writes mark all 8 covered rows) and only flagged rows are
+re-decoded; the border is repainted only when the border colour changes
+(`EMU.last_update_border_color`, `0xff` = forced). The cart FB keeps the
+previous frame between calls, which is what makes skipping clean rows
+correct. **Anything that touches VRAM behind the hooks must call
 `vram_force_dirty()` first** — current callers: the FLASH blink toggle,
 the menu/About overlay draw *and* its restore, `load_game()` (snapshots
-write VRAM directly and borrow `fb_chunked_buffer`), and
-`init_emulator()`. Missing one shows up as stale screen regions.
+write VRAM directly), and `init_emulator()`. Missing one shows up as
+stale screen regions.
 
-Per row it reads the Spectrum bitmap byte at
-`((py&0xC0)<<5)|((py&0x07)<<8)|((py&0x38)<<2)|(px>>3)` and attribute at
-`0x1800+((py>>3)<<5)+(px>>3)`, applies BRIGHT (`(attr&0x40)>>3` → +8)
-and FLASH (swap ink/paper on blink phase), and writes each 8-pixel cell
-as **two 32-bit stores** through the `zx_nib_mask[16]` nibble→byte-lane
-table (`(inkw & m) | (paperw & ~m)`) into
-`fb_chunked_buffer[(4+py)*320 + 32 ...]` — byte-for-byte identical to
-the old per-pixel loop (validated offline over every bits/attr/blink
-combination). The 16 ZX colours are pushed to the ST shifter palette in
-`zx_set_palette()` (`zxpalette` is `0x00BBGGRR` → `PALETTE_RGB` 3-bit
-channels).
+Per row (bottom-up — see the framebuffer pipeline) it reads the Spectrum
+bitmap byte at `((py&0xC0)<<5)|((py&0x07)<<8)|((py&0x38)<<2)|(px>>3)` and
+attribute at `0x1800+((py>>3)<<5)+(px>>3)`, applies BRIGHT
+(`(attr&0x40)>>3` → +8) and FLASH (swap ink/paper on blink phase), and
+writes each pair of cells as one 16-pixel ST group (two 32-bit stores).
+Per pair of planes a cell is `paper ^ ((ink ^ paper) & bits)` over the
+byte-lane masks in `zx_plane_lanes[4]` (lanes 0/2 = right cell, << 8 =
+left cell). Validated offline: byte-identical cart-FB contents to the old
+chunky decode → c2p → chunk-reversed publish (mirrored in C from the
+asm) over 2,000 random frames of game writes, border/FLASH/overlay
+changes, from three different starting cart contents. A full repaint is
+~106 Thumb instructions per cell pair (register-starved on M0+), so
+~1 ms at 400 MHz; the About pop-over's `dsp` figure reports the mean and
+worst decode per second. The 16 ZX colours are pushed to the ST shifter
+palette in `zx_set_palette()` (`zxpalette` is `0x00BBGGRR` →
+`PALETTE_RGB` 3-bit channels).
 
 ### Input (direct ST→Spectrum mapping — replaced the keymap system)
 
@@ -500,13 +514,17 @@ it.
 
 `/speccy` (config `ACONFIG_PARAM_FOLDER`). `populate_games_list()` enumerates
 `.z80` and `.sna` (`snapshot_type()` classifies by extension);
-`load_game()` reads a snapshot **into the 64 KB `fb_chunked_buffer`**
-(borrowed as a transient load buffer — it's overwritten by the next
-render, so no permanent allocation) then `zx_quickload` (.z80) or
-`zx_quickload_sna` (.sna — 48K only: 27-byte header + raw 48 KB dump,
-PC popped RETN-style off the snapshot stack; 128K images are a
-different size and are rejected. Lives in `zxemu.c`, not the vendored
-core). No game auto-loads: boot leaves the menu active so the
+`load_game()` **streams** the snapshot from the file straight into
+Spectrum RAM through a 512-byte buffer (`s_load_buf`, in the cart hole):
+`zx_load_z80` (versions 1-3, 48K only; RLE decoded on the fly, raw
+`0xFFFF` pages and uncompressed v1 handled, 128K hardware modes rejected
+before anything is written) or `zx_load_sna` (27-byte header + raw 48 KB
+dump, PC popped RETN-style off the snapshot stack; 128K images are a
+different size and are rejected). Both live in `zxemu.c`; the vendored
+`zx_quickload` (whole file in memory) is no longer used. Validated
+offline against `zx_quickload` / the old `.sna` loader on the embedded
+games and generated v1/v2/v3/.sna files: identical RAM, registers, pins
+and border. No game auto-loads: boot leaves the menu active so the
 user always picks. After the scan, each entry in `BuiltinGames[]` is
 written to `/speccy` with `FA_CREATE_NEW` — present already, nothing
 happens; deleted by the user, it reappears next boot. (There is no keymap
@@ -515,8 +533,10 @@ file any more — input is the direct mapping described above.)
 ### RAM budget — CRITICAL, read before adding statics
 
 The 48 KB Spectrum RAM (`zx_t.ram[3][0x4000]`) is irreducible, and the
-22 KB Z80 decoder is pinned into RAM as well, so the port only just fits
-the 192 KB region. `.bss`+heap must not cross `0x20030000`.
+22 KB Z80 decoder is pinned into RAM as well. `.bss`+heap must not cross
+`0x20030000`. Since the framebuffer pipeline stopped using RP RAM (no
+chunky buffer, no planar scratch) the heap window is ~105 KB — the room a
+128K machine's extra 80 KB of banks would need.
 
 **The heap floor is ~9.5 KB — an overflow here does NOT fail the link.**
 The boot-time settings library mallocs a **4 KB buffer each for gconfig
@@ -531,8 +551,7 @@ If a boot-time malloc fails, `gconfig_init`/`aconfig_init` fail and
 `main.c` **jumps to Booster** — the symptom is "app launches then lands
 straight back in Booster", which looks like a crash but is a deliberate
 bail. Check heap after every RAM change: `0x20030000 - __bss_end__` in
-the `.map` (currently ~10.8 KB release / ~10.5 KB debug, i.e. ~1.1-1.4 KB
-of margin — thin, so weigh any new RAM-resident code against it).
+the `.map` (currently 107,616 B release / 107,320 B debug).
 
 **Byte arithmetic is not enough**: newlib's full malloc grows the heap
 in **page-rounded (4 KB) sbrk steps**, so without countermeasures a
@@ -563,8 +582,8 @@ fit were:
    section parks `commRing` (1 KB), `GamesTable` (2.25 KB),
    `s_vram_save` (6.75 KB), the `zx_t` audio ring (1 KB, now a pointer —
    `MODIFIED` in `zx.h`), both `mem.h` dummy pages (2 KB, `MODIFIED`)
-   and the demo sprite (256 B) there — **~13 KB reclaimed from `RAM`**,
-   ~1.5 KB still free. Tag a buffer into it with
+   and the snapshot load buffer (512 B) there — **~13 KB reclaimed from
+   `RAM`**, ~1.25 KB still free. Tag a buffer into it with
    `__attribute__((section(".cart_app_free.<name>")))`.
    Constraints: the section is `NOLOAD`, so nothing there is zero-inited
    by the CRT — only park buffers first touched **after** `emul_start()`
@@ -580,6 +599,12 @@ fit were:
 6. Dropped a 50 KB `static zx_t im` from the unused `zx_load_snapshot`
    (it was already `--gc-sections`'d away, so this was cosmetic — the
    real wins were 1–5).
+7. **No RP-side framebuffer** — the template's 64,000 B chunky buffer
+   and 32,000 B planar scratch (plus the c2p and reverse-copy code in
+   RAM) went when `update_display()` started writing the cart FB
+   directly; snapshot loading, which borrowed the chunky buffer, now
+   streams. Heap window 10,772 → 107,616 B (release). The same move is
+   what freed md-xt's RAM for its page cache.
 
 Diagnose overflow with the linker `.map` (`rp/build-*/rp.elf.map`), not
 by estimating: `--gc-sections` drops unused statics, and non-`const`
@@ -596,7 +621,7 @@ actually costs is set by that exit, not by the microseconds asked for.
 `zx_frame_usec()` in `zxemu.c` requests 200 scanlines' worth — comfortably
 inside the `(1, 256)` scanline window for every `scanline_period` the
 `scan-p` menu item allows — so **one call advances exactly one emulated
-frame**, matching the 50 Hz VBL that `fb_publish()` already paces us to.
+frame**, matching the 50 Hz VBL that `fb_wait_vbl()` already paces us to.
 
 Upstream's flat `FRAME_USEC` of 25000 µs overshot the first frame's
 scanline 256 and ran on to the second: two emulated frames of work per
@@ -621,10 +646,12 @@ needs 1.98x and 400 MHz offers at most 1.78x of core, diluted by a slower
 flash divider.
 
 **Measuring:** `zxemu_render_frame()` times `zx_exec()` and averages over
-a ~1 s window into `EMU.perf_exec_us` / `EMU.perf_fps_x10`. The About
-pop-over shows both (`emu 13.2ms  fps 50.0`), so a release build on
-hardware reports its own speed; debug builds also `DPRINTF` it each
-window. Under 20 ms of emulation per frame means full speed. The figures
+a ~1 s window into `EMU.perf_exec_us` / `EMU.perf_fps_x10`, plus the
+display decode (`perf_disp_us`, worst frame `perf_disp_max_us`) and the
+time blocked in `fb_wait_vbl()` (`perf_wait_us`). The About pop-over
+shows them (`emu 13.2ms  fps 50.0`, `dsp 0.3/1.0 wait 5.1ms`), so a
+release build on hardware reports its own speed; debug builds also
+`DPRINTF` them each window. Under 20 ms of emulation per frame means full speed. The figures
 include the pop-over's own compositing cost, so they read slightly below
 the in-play rate.
 

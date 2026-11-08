@@ -61,7 +61,7 @@ The RP2040 runs the full Spectrum on Core 0 and decodes its video memory straigh
 
 ```
 IKBD keyboard bytes        ──$FB82xx──►  demux → Spectrum keys / Kempston
-                                         Core 1: chunky → ST planar (c2p)
+Blit to ST screen per VBL  ◄──$FA8300──  Spectrum VRAM → ST planar (changed rows)
 Timer-B: write YM volumes  ◄──$FA4100──  beeper → (vA,vB) pairs, filled per VBL
 ```
 
