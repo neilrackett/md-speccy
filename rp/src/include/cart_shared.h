@@ -44,7 +44,9 @@
  *   $FA4100  AUDIO_BUFFER        1 KB  (beeper samples, see below)
  *   $FA4500  AY block            32 B  (the 128's AY registers for the
  *                                        YM, see CART_AY_OFFSET)
- *   $FA4520  (free)                    up to the RP-only .cart_app_free
+ *   $FA4520  SPEAKER              2 B  (TT internal speaker on/off, see
+ *                                        CART_SPEAKER_OFFSET)
+ *   $FA4522  (free)                    up to the RP-only .cart_app_free
  *                                        section at $FA4800
  *   $FA8300  FRAMEBUFFER          32 KB (320x200 4 bpp low-res)
  *   $FAFFFF  end of region
@@ -104,6 +106,14 @@
 #define CART_AY_R13SEQ_WORD              1
 #define CART_AY_REGS_WORD                2
 #define CART_AY_SIZE                     32
+
+/* TT internal speaker ($FA4520): one word, the menu's TT speaker setting,
+ * published by the RP every frame (zxemu.c): 0 = off, 1 = on. Zero, as
+ * the erased region starts, is off, the default. On a TT only, the m68k
+ * applies it at its next VBL by switching bit 6 of the YM's port A
+ * (userfw.s ufw_speaker_apply). Must match SPEAKER_ADDR in userfw.s, and
+ * stay below the RP-only .cart_app_free section. */
+#define CART_SPEAKER_OFFSET              (CART_AY_OFFSET + CART_AY_SIZE)  /* $4520 */
 
 /* Tag a buffer into the .cart_app_free linker section -- the unused
  * RAM between APP_FREE and the framebuffer inside the shared region

@@ -163,6 +163,11 @@ fast, so speed (the About box's figures) and the Core 1 audio timer's
 cadence are not real — check those on hardware; picture, input, the
 cart-bus protocol and the YM/DMA audio paths are.
 
+To drive the menu headless, pass `-- --cmd-fifo FIFO` (Hatari creates
+it) and write `hatari-event keydown N` / `keyup N` lines with ST
+scancodes (↑ 72, → 77, ← 75, Return 28), a few hundred ms apart.
+`keypress N` sends both at once and drops keys.
+
 If Hatari hangs at launch with no output (even `--version`) on macOS,
 it's AppKit's "reopen windows?" alert, hidden behind other windows, left
 by force-killed Hatari instances: `defaults write org.hatari-emu.Hatari
@@ -271,7 +276,8 @@ Two back-ends, both compiled into `userfw.s`, chosen at boot from the
   `userfw_vbl` resets the A0 read cursor to the buffer base every VBL.
 
 The m68k reports the detected capability every VBL via a cart read at
-`SNDCAP_WINDOW_BASE + has_dma` (`$FB8600/1`), and in DMA mode the
+`SNDCAP_WINDOW_BASE + UFW_SNDCAP` (`$FB8600..3`: bit 0 DMA sound, bit 1
+a TT — see "TT speaker"), and in DMA mode the
 measured length at `SNDLEN_WINDOW_BASE + len - STE_SND_LEN_MIN`
 (`$FB8C00`). `fb_rom3_dispatch` hands both to
 `audio_consume_rom3_sample()`, which owns the windows →
@@ -621,6 +627,33 @@ host core. Run end to end in EmuMD (see Tests / verification) on an STE
 and a plain ST: Taipan's music plays at the pitches the host core's AY
 registers give, stops on the menu's exit, and on the plain ST the
 beeper's key clicks and `BEEP` come back after a 48K is started.
+
+### TT speaker
+
+On a TT only, the menu has a **TT speaker** setting (0 = off, the
+default; 1 = on) for the TT's internal speaker. Its enable is bit 6 of
+the YM's port A, **active low**: the TT030 Hardware Reference Manual's
+port A table reads "*Speaker Disable (0 disables internal speaker)"
+(Hatari doesn't emulate the speaker, and EmuTOS boots a TT with it
+clear). Don't reuse this on a Falcon without checking its polarity.
+
+- `userfw.s` finds a TT from `_MCH` (high word 2) through `ufw_cookie`
+  (shared with the `_SND` lookup) and reports it as bit 1 of SNDCAP;
+  `audio_has_tt_speaker()` latches it (a list that only grows keeps the
+  menu selection valid).
+- The item is `SettingsList[0]` and must stay first: elsewhere the menu
+  starts one entry later (`settings_first()` / `settings_count()` /
+  `settings_id()` map menu positions to entries).
+- The RP writes the setting every frame to `CART_SPEAKER_OFFSET`
+  (`$FA4520`, just after the AY block); zero, as the erased region
+  starts, is off. `ufw_speaker_apply` read-modify-writes port A at IPL 7
+  on a TT when the value changes (the other bits are the floppy selects,
+  printer strobe, RTS/DTR and LAN select), then re-latches reg 8 for the
+  Timer-B beeper. Boot saves port A; the exit to GEM puts bit 6 back.
+
+Run in EmuMD with `make emu MACHINE=tt TOS=<EmuTOS 512k image>`: the
+256k EmuTOS EmuMD downloads can't run a TT, and Hatari silently falls
+back to an STE. Hatari's `--trace psg_write` shows the port A writes.
 
 ### SD games
 

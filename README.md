@@ -38,7 +38,7 @@ Caps Lock.
 
 A real ST joystick works as Kempston too.
 
-The menu also has a **boot** item (← → to choose 48K or 128K, then select to start that Spectrum from its ROM), an **about** item (version and credits) and an **exit** item to quit back to GEM. In the 128K's start-up menu, use Shift+6 / Shift+7 (or set **cursor** to keys) and Return.
+The menu also has a **boot** item (← → to choose 48K or 128K, then select to start that Spectrum from its ROM), an **about** item (version and credits) and an **exit** item to quit back to GEM. On a TT, a **TT speaker** setting turns the TT's internal speaker on (1) or off (0, the default); it goes back to how TOS had it when you exit. In the 128K's start-up menu, use Shift+6 / Shift+7 (or set **cursor** to keys) and Return.
 
 ## Installation
 

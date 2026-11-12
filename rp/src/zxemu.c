@@ -233,6 +233,8 @@ struct emustate {
 
     // Audio related
     uint32_t volume;            // Audio volume. Controls PWM value.
+    uint32_t tt_speaker;        // TT internal speaker on (1) or off (0, the
+                                // default). Offered on a TT only.
     volatile uint32_t audio_sample_wait; // Wait time (in busy loop cycles)
                                          // between samples when playing back.
 
@@ -303,6 +305,10 @@ struct UISettingsItem {
 } SettingsList[] = {
     // Left/right adjust the value; items with a NULL ptr are actions
     // triggered by fire (Exit). Only settings that do something here.
+    // Shown on a TT only, so it must stay first: elsewhere the menu's
+    // settings start one entry later (settings_first()).
+    {UI_EVENT_NONE,
+        "TT speaker", &EMU.tt_speaker, 1, 0, 1, NULL, NULL},
     {UI_EVENT_VOLUME,
         "volume", &EMU.volume, 1, 0, 20, NULL, NULL},
     {UI_EVENT_BORDER,
@@ -321,6 +327,14 @@ struct UISettingsItem {
 };
 
 #define SettingsListLen (sizeof(SettingsList)/sizeof(SettingsList[0]))
+
+// The menu's settings are SettingsList from settings_first() on: the TT
+// speaker item (entry 0) only once the m68k has reported a TT. A menu
+// position (selected_game < 0, -1 being the item next to the games) maps
+// to its SettingsList entry with settings_id().
+static inline int settings_first(void) { return audio_has_tt_speaker() ? 0 : 1; }
+static inline int settings_count(void) { return (int)SettingsListLen - settings_first(); }
+static inline int settings_id(int pos) { return -pos - 1 + settings_first(); }
 
 // Convert the setting 'id' name and current value into a string
 // to show as menu item.
@@ -463,10 +477,10 @@ void ui_draw_string(uint16_t px, uint16_t py, const char *s, uint8_t color, uint
 // Load the prev/next game in the list (dir = -1 / 1).
 void ui_go_next_prev_game(int dir) {
     EMU.selected_game += dir;
-    if (EMU.selected_game == -SettingsListLen-1) {
+    if (EMU.selected_game == -settings_count()-1) {
         EMU.selected_game = GamesTableSize-1;
     } else if (EMU.selected_game == GamesTableSize) {
-        EMU.selected_game = -SettingsListLen;
+        EMU.selected_game = -settings_count();
     }
 }
 
@@ -478,7 +492,7 @@ static void ui_menu_select(void) {
         EMU.menu_active = 0;
         EMU.menu_left_at_tick = EMU.tick;
     } else {
-        struct UISettingsItem *si = &SettingsList[-EMU.selected_game - 1];
+        struct UISettingsItem *si = &SettingsList[settings_id(EMU.selected_game)];
         if (si->event == UI_EVENT_EXIT) ikbd_request_boot_gem();
         else if (si->event == UI_EVENT_ABOUT) EMU.about_active = 1;
         else if (si->event == UI_EVENT_BOOT) {
@@ -494,7 +508,7 @@ static void ui_menu_select(void) {
 // Left/right on a settings item adjusts its value.
 static void ui_menu_adjust(int dir) {
     if (EMU.selected_game < 0)
-        settings_change_value(-EMU.selected_game - 1, dir);
+        settings_change_value(settings_id(EMU.selected_game), dir);
 }
 
 // If the menu is active, draw it into the Spectrum VRAM. Cell-aligned
@@ -516,7 +530,7 @@ void ui_draw_menu(void) {
 
     // Scroll so the highlighted item stays roughly centred.
     int first = (int)EMU.selected_game - rows / 2;
-    if (first < -(int)SettingsListLen) first = -(int)SettingsListLen;
+    if (first < -settings_count()) first = -settings_count();
 
     ui_set_crop_area(menu_x, 255, menu_y, menu_y + menu_h - 1);
 
@@ -541,7 +555,7 @@ void ui_draw_menu(void) {
             size_t n = strlen(line);
             if (snapshot_type(line)) line[n-4] = 0;
         } else {
-            settings_to_string(line, sizeof(line), -j - 1);
+            settings_to_string(line, sizeof(line), settings_id(j));
         }
 
         if (sel) {
@@ -1168,6 +1182,7 @@ void init_emulator(void) {
     EMU.show_border = DEFAULT_DISPLAY_BORDERS;
     EMU.scaling = DEFAULT_DISPLAY_SCALING;
     EMU.volume = 20;
+    EMU.tt_speaker = 0;        // a TT's internal speaker off until switched on
     EMU.brightness = ST77_MAX_BRIGHTNESS;
     EMU.partial_update = DEFAULT_DISPLAY_PARTIAL_UPDATE;
     EMU.audio_sample_wait = 300;
@@ -1431,6 +1446,18 @@ static void zx_ay_publish(void) {
     blk[CART_AY_ACTIVE_WORD] = hold != 0;
 }
 
+// The menu's TT speaker setting, for the m68k to apply at its next VBL
+// (userfw.s ufw_speaker_apply, which only acts on a TT and only when the
+// value changes). Written every frame beside the AY block.
+_Static_assert(CART_SPEAKER_OFFSET + 2 <= 0x4800,
+               "TT speaker word must stay below .cart_app_free");
+
+static void zx_speaker_publish(void) {
+    volatile uint16_t *spk = (volatile uint16_t *)
+        ((uint8_t *)&__rom_in_ram_start__ + CART_SPEAKER_OFFSET);
+    *spk = EMU.tt_speaker != 0;
+}
+
 void zxemu_render_frame(void) {
     uint8_t joy = ikbd_get_joystick();  // bit0 up,1 down,2 left,3 right,7 fire
     static uint8_t prev_joy = 0;
@@ -1526,6 +1553,7 @@ void zxemu_render_frame(void) {
     const uint32_t td0 = time_us_32();
     update_display();
     zx_ay_publish();
+    zx_speaker_publish();
     const uint32_t td = time_us_32() - td0;
     acc_wait_us += td0 - tw;
     acc_disp_us += td;

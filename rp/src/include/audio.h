@@ -35,6 +35,7 @@
 #ifndef AUDIO_H_INCLUDED
 #define AUDIO_H_INCLUDED
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -78,9 +79,14 @@ uint32_t audio_get_fill_bytes(void);
 void audio_set_fill_bytes(uint32_t bytes);
 
 /* Decode one ROM3 cart-bus sample: the sound-capability report picks
- * the back-end, the buffer-length report sets the refill size. Called
- * from the ROM3 dispatcher. */
+ * the back-end (and says whether this is a TT), the buffer-length report
+ * sets the refill size. Called from the ROM3 dispatcher. */
 void audio_consume_rom3_sample(uint16_t addr_lsb);
+
+/* True once the m68k has reported a TT (bit 1 of the sound-capability
+ * report), whose internal speaker can be switched on and off; false
+ * until then and on every other machine. */
+bool audio_has_tt_speaker(void);
 
 /* Start the VBL-synced refill on `core` (0 or 1; 1 strongly preferred
  * -- a Core 1 alarm pool binds the interrupt there, so the refill never
